@@ -29,9 +29,6 @@ class TradingEnv:
         self.curr_td_df = self.trading_day_groups.get_group((self.current_day,))
         rth_mask = self.curr_td_df['ovn'] == 0
 
-        if rth_mask[rth_mask].empty:
-            return False
-
         self.t_idx = rth_mask[rth_mask].index[0]
 
         ovn_df = self.curr_td_df[~rth_mask & (self.curr_td_df.index < self.t_idx)]
@@ -42,7 +39,7 @@ class TradingEnv:
 
         self.daily_stats.update(stats_util.calc_ib_stats(self.curr_td_df))
 
-        self.minute_df = self.curr_td_df.resample('1Min', on='dt').agg({'Close':'ohlc', 'Volume':'sum'})
+        self.minute_df = self.curr_td_df.resample('1Min', on='dt').agg({'Close':'ohlc', 'Volume':'sum'}).bfill()
 
         self.minute_df["sma5"] = talib.SMA(self.minute_df["Close"]['close'], timeperiod=5)
         self.minute_df["sma20"] = talib.SMA(self.minute_df["Close"]['close'], timeperiod=20)
@@ -57,17 +54,15 @@ class TradingEnv:
         self.pnl_day = 0.0
         self.trade_count = 0
 
-        return True
-        
-
     def reset(self):
 
-        if not self._init_day():
-            self.current_day = 0
-            self._init_day()
-        
-        # increment day for the next iteration
         self.current_day += 1
+
+        try:
+            self._init_day()
+        except:
+            self.current_day = 1
+            self._init_day()
 
         return self._get_state()
     
