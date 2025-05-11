@@ -201,7 +201,7 @@ class CostNet(QNet): pass
 
 # --- 4. Training Loop (simplified) ---
 
-def train_sac(env, buffer, params):
+def train_sac(env, buffer, params, load_cpt=False):
 
     # 1) Build the lookup table once at init
     K = 2
@@ -220,14 +220,25 @@ def train_sac(env, buffer, params):
     eta_lambda = params['eta_lambda']
     T_max = env.N_max
 
-    # Instantiate networks and optimizers
-    policy = PolicyNet(state_dim, action_dim)
-    qr1 = QNet(state_dim, action_dim); qr2 = QNet(state_dim, action_dim)
-    qc1_1 = QNet(state_dim, action_dim); qc1_2 = QNet(state_dim, action_dim)
-    qc2_1 = QNet(state_dim, action_dim); qc2_2 = QNet(state_dim, action_dim)
-    qr1_t  = QNet(state_dim, action_dim); qr2_t  = QNet(state_dim, action_dim)
-    qc1_1_t= QNet(state_dim, action_dim); qc1_2_t= QNet(state_dim, action_dim)
-    qc2_1_t= QNet(state_dim, action_dim); qc2_2_t= QNet(state_dim, action_dim)
+    # Check if GPU is available and set the device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Instantiate networks and optimizers  
+    policy = PolicyNet(state_dim, action_dim).to(device)
+    qr1 = QNet(state_dim, action_dim).to(device)
+    qr2 = QNet(state_dim, action_dim).to(device)
+    qc1_1 = QNet(state_dim, action_dim).to(device)
+    qc1_2 = QNet(state_dim, action_dim).to(device)
+    qc2_1 = QNet(state_dim, action_dim).to(device)
+    qc2_2 = QNet(state_dim, action_dim).to(device)
+    qr1_t = QNet(state_dim, action_dim).to(device)
+    qr2_t = QNet(state_dim, action_dim).to(device)
+    qc1_1_t = QNet(state_dim, action_dim).to(device)
+    qc1_2_t = QNet(state_dim, action_dim).to(device)
+    qc2_1_t = QNet(state_dim, action_dim).to(device)
+    qc2_2_t = QNet(state_dim, action_dim).to(device)
+
     for src, tgt in [(qr1, qr1_t),(qr2, qr2_t),(qc1_1, qc1_1_t),(qc1_2, qc1_2_t),(qc2_1, qc2_1_t),(qc2_2, qc2_2_t)]:
         tgt.load_state_dict(src.state_dict())
 
@@ -236,14 +247,39 @@ def train_sac(env, buffer, params):
     opt_c1 = optim.Adam(list(qc1_1.parameters()) + list(qc1_2.parameters()), lr=lr)
     opt_c2 = optim.Adam(list(qc2_1.parameters()) + list(qc2_2.parameters()), lr=lr)
     # Lagrange multipliers
-    lambda1 = torch.tensor(0.0, requires_grad=False)
-    lambda2 = torch.tensor(0.0, requires_grad=False)
+    lambda1 = torch.tensor(0.0, requires_grad=False, device=device)
+    lambda2 = torch.tensor(0.0, requires_grad=False, device=device)
+
+    if load_cpt:
+        checkpoint = load_checkpoint('checkpoint/sac.pt')
+        policy.load_state_dict(checkpoint['policy_state'])
+        qr1.load_state_dict(checkpoint['qr1_state'])
+        qr2.load_state_dict(checkpoint['qr2_state'])
+        qc1_1.load_state_dict(checkpoint['qc1_1_state'])
+        qc1_2.load_state_dict(checkpoint['qc1_2_state'])
+        qc2_1.load_state_dict(checkpoint['qc2_1_state'])
+        qc2_2.load_state_dict(checkpoint['qc2_2_state'])
+        qr1_t.load_state_dict(checkpoint['qr1_t_state'])
+        qr2_t.load_state_dict(checkpoint['qr2_t_state'])
+        qc1_1_t.load_state_dict(checkpoint['qc1_1_t_state'])
+        qc1_2_t.load_state_dict(checkpoint['qc1_2_t_state'])
+        qc2_1_t.load_state_dict(checkpoint['qc2_1_t_state'])
+        qc2_2_t.load_state_dict(checkpoint['qc2_2_t_state'])
+
+        opt_policy.load_state_dict(checkpoint['policy_opt_state'])
+        opt_q.load_state_dict(checkpoint['q_opt_state'])
+        opt_c1.load_state_dict(checkpoint['c1_opt_state'])
+        opt_c2.load_state_dict(checkpoint['c2_opt_state'])
+        lambda1 = torch.tensor(checkpoint['lambda1'])
+        lambda2 = torch.tensor(checkpoint['lambda2'])
 
     for epoch in range(params['epochs']):
-        print('eopch', epoch)
+        print(f'Epoch {epoch + 1}/{params["epochs"]}')
         state = env.reset()
+        epoch_rewards = []
+        epoch_costs = []
         for t in range(params['steps_per_epoch']):
-            s = torch.tensor(state).unsqueeze(0)
+            s = torch.tensor(state, device=device).unsqueeze(0)
             dist = policy(s)
             a_idx = dist.sample().item()  # discrete action id maps to (a, exit)
 
@@ -253,41 +289,30 @@ def train_sac(env, buffer, params):
             next_s, r, c1, c2, done = env.step((pos_adj, exit_flag))
             buffer.push(state, a_idx, r, c1, c2, next_s, done)
             state = next_s
+            epoch_rewards.append(r)
+            epoch_costs.append((c1, c2))
             if done:
                 state = env.reset()
 
             # Update networks
             if len(buffer) >= batch_size:
                 batch = Transition(*zip(*buffer.sample(batch_size)))
-                sb = torch.tensor(np.array(batch.state))
+                sb = torch.tensor(np.array(batch.state), device=device)
 
-                ab_idx = torch.tensor(batch.action)
+                ab_idx = torch.tensor(batch.action, device=device)
                 # one-hot encode actions for critics
-                ab_onehot = nn.functional.one_hot(ab_idx, num_classes=action_dim).float()
+                ab_onehot = nn.functional.one_hot(ab_idx, num_classes=action_dim).float().to(device)
 
-                rb = torch.tensor(batch.reward)
-                c1b = torch.tensor(batch.cost1)
-                c2b = torch.tensor(batch.cost2)
-                nsb = torch.tensor(np.array(batch.next_state))
-                doneb = torch.tensor(batch.done, dtype=torch.float32)
+                rb = torch.tensor(batch.reward, device=device)
+                c1b = torch.tensor(batch.cost1, device=device)
+                c2b = torch.tensor(batch.cost2, device=device)
+                nsb = torch.tensor(np.array(batch.next_state), device=device)
+                doneb = torch.tensor(batch.done, dtype=torch.float32, device=device)
 
                 # Critic target computation with random next actions
                 with torch.no_grad():
-                    # next actions
-                    # dist_next = policy(nsb)
-                    # a_next = dist_next.sample()
-                    # logp_next = dist_next.log_prob(a_next)
-                    # q1n = q1_tar(nsb, a_next)
-                    # q2n = q2_tar(nsb, a_next)
-                    # qc = torch.min(q1n, q2n) - alpha * logp_next
-                    # target_q = rb + (1-doneb) * gamma * qc
-                    # cost critic targets
-                    # c1n = cost1_tar(nsb, a_next); c2n = cost2_tar(nsb, a_next)
-                    # target_c1 = c1b + (1-doneb) * gamma * c1n
-                    # target_c2 = c2b + (1-doneb) * gamma * c2n
-
-                    rand_idx = torch.randint(0, action_dim, (batch_size,))
-                    rand_onehot = nn.functional.one_hot(rand_idx, action_dim).float()
+                    rand_idx = torch.randint(0, action_dim, (batch_size,), device=device)
+                    rand_onehot = nn.functional.one_hot(rand_idx, action_dim).float().to(device)
                     q1n = qr1_t(nsb, rand_onehot)
                     q2n = qr2_t(nsb, rand_onehot)
 
@@ -328,7 +353,7 @@ def train_sac(env, buffer, params):
                 # Actor update
                 dist_s = policy(sb)
                 a_samp = dist_s.sample()
-                a_samp_onehot = nn.functional.one_hot(a_samp, action_dim).float()
+                a_samp_onehot = nn.functional.one_hot(a_samp, action_dim).float().to(device)
                 logp = dist_s.log_prob(a_samp)
                 q1_val = qr1(sb, a_samp_onehot)
                 q2_val = qr2(sb, a_samp_onehot)
@@ -344,21 +369,28 @@ def train_sac(env, buffer, params):
                 Jc1 = c1b.mean(); Jc2 = c2b.mean()
                 lambda1 = torch.clamp(lambda1 + eta_lambda*(Jc1 - 0.0), min=0.0)
                 lambda2 = torch.clamp(lambda2 + eta_lambda*(Jc2 - T_max), min=0.0)
-
+                # Print losses
+                # print(f"Step {t + 1}/{params['steps_per_epoch']}, Loss Q: {loss_q.item():.4f}, Loss C1: {loss_c1.item():.4f}, Loss C2: {loss_c2.item():.4f}, Actor Loss: {actor_loss.item():.4f}")
 
                 # Soft target updates
                 for (src, tgt) in [(qr1, qr1_t), (qr2, qr2_t), (qc1_1, qc1_1_t), (qc1_2, qc1_2_t), (qc2_1, qc2_1_t), (qc2_2, qc2_2_t)]:
                     for p_src, p_tgt in zip(src.parameters(), tgt.parameters()):
                         p_tgt.data.copy_(p_tgt.data * (1-tau) + p_src.data * tau)
 
+        # Print epoch statistics
+        avg_reward = np.mean(epoch_rewards)
+        avg_cost1 = np.mean([c[0] for c in epoch_costs])
+        avg_cost2 = np.mean([c[1] for c in epoch_costs])
+        print(f"Epoch {epoch + 1} completed. Avg Reward: {avg_reward:.4f}, Avg Cost1: {avg_cost1:.4f}, Avg Cost2: {avg_cost2:.4f}")
+
         if epoch % 10 == 0:
-            save_checkpoint('checkpoint/sac.pt', epoch, policy, qr1, qr2, qc1_1, qc1_2, qc2_1, qc2_2,
+            save_checkpoint('checkpoint/sac.pt', epoch, policy, qr1, qr2, qc1_1, qc1_2, qc2_1, qc2_2, qr1_t, qr2_t, qc1_1_t, qc1_2_t, qc2_1_t, qc2_2_t,
                     opt_policy, opt_q, opt_c1, opt_c2, lambda1.item(), lambda2.item())
 
     return policy, qr1, qr2, qc1_1, qc1_2, qc2_1, qc2_2
 
 
-def save_checkpoint(path, epoch, policy, qr1, qr2, qc1_1, qc1_2, qc2_1, qc2_2,
+def save_checkpoint(path, epoch, policy, qr1, qr2, qc1_1, qc1_2, qc2_1, qc2_2, qr1_t, qr2_t, qc1_1_t, qc1_2_t, qc2_1_t, qc2_2_t,
                     policy_opt, q_opt, c1_opt, c2_opt, lambda1, lambda2):
     """
     Save model and optimizer states to a checkpoint file.
@@ -373,6 +405,12 @@ def save_checkpoint(path, epoch, policy, qr1, qr2, qc1_1, qc1_2, qc2_1, qc2_2,
         'qc1_2_state': qc1_2.state_dict(),
         'qc2_1_state': qc2_1.state_dict(),
         'qc2_2_state': qc2_2.state_dict(),
+        'qr1_t_state': qr1_t.state_dict(),
+        'qr2_t_state': qr2_t.state_dict(),
+        'qc1_1_t_state': qc1_1_t.state_dict(),
+        'qc1_2_t_state': qc1_2_t.state_dict(),
+        'qc2_1_t_state': qc2_1_t.state_dict(),
+        'qc2_2_t_state': qc2_2_t.state_dict(),
         'policy_opt_state': policy_opt.state_dict(),
         'q_opt_state': q_opt.state_dict(),
         'c1_opt_state': c1_opt.state_dict(),
@@ -389,25 +427,6 @@ def load_checkpoint(path, device='cpu'):
     """
     checkpoint = torch.load(path, map_location=device)
     return checkpoint
-
-# Usage:
-#
-# checkpoint = load_checkpoint("checkpoints/sac_checkpoint.pt")
-# policy.load_state_dict(checkpoint['policy_state'])
-# qr1.load_state_dict(checkpoint['qr1_state'])
-# qr2.load_state_dict(checkpoint['qr2_state'])
-# qc1_1.load_state_dict(checkpoint['qc1_1_state'])
-# qc1_2.load_state_dict(checkpoint['qc1_2_state'])
-# qc2_1.load_state_dict(checkpoint['qc2_1_state'])
-# qc2_2.load_state_dict(checkpoint['qc2_2_state'])
-# opt_policy.load_state_dict(checkpoint['policy_opt_state'])
-# opt_q.load_state_dict(checkpoint['q_opt_state'])
-# opt_c1.load_state_dict(checkpoint['c1_opt_state'])
-# opt_c2.load_state_dict(checkpoint['c2_opt_state'])
-# lambda1 = torch.tensor(checkpoint['lambdas']['lambda1'])
-# lambda2 = torch.tensor(checkpoint['lambdas']['lambda2'])
-# tau = checkpoint['tau']
-
 
 
 # Example usage:
