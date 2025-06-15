@@ -6,6 +6,10 @@ import numpy as np
 def sigmoid(x):
 	return 1 / (1 + np.exp(-x))
 
+range_filename = 'range_predictions.csv'
+range_df = pd.read_csv(range_filename)
+range_df['Date'] = pd.to_datetime(range_df['Date'])
+
 
 data_filename = '../test_seconds_td0.csv'
 sec_df = pd.read_csv(data_filename)
@@ -18,18 +22,17 @@ sec_df['price_s'] = sec_df['Close']
 dt_idx = 'dt'
 day_idx = 'trading_day'
 
-rev_model = ReversalModel(sec_df, dt_idx=dt_idx, day_idx=day_idx)
+rev_model = ReversalModel(sec_df, dt_idx=dt_idx, day_idx=day_idx, range_df=range_df)
 
 rev_model_features = rev_model.compute_features()
 rev_model.train()
 
 prob_rev, _ = rev_model.predict(rev_model.min_df)
 
-# pred_rev = (prob_rev>=0.5).astype(int)
-
+rev_model.bst.save_model('rev_model.json')
+# exit()
 
 # min_df = rev_model.min_df
-
 # fd = min_df[min_df[day_idx]==min_df[day_idx].unique()[0]]
 # plt.figure(figsize=(10,4))
 # plt.plot(fd[dt_idx], fd['price'], label='Price')
@@ -46,6 +49,8 @@ prob_rev, _ = rev_model.predict(rev_model.min_df)
 utility_model = UtilityModel(rev_model.min_df, rev_model.min_df['pred_rev'], day_idx=day_idx)
 
 utility_model.train()
+
+utility_model.f_theta_full.save_model('utility_model.json')
 
 
 from backtesting import Strategy

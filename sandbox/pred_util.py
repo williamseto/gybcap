@@ -177,11 +177,12 @@ def calibrate_threshold(slot, df_sorted, T_base, target_util=-0.1):
     return best_T
 
 class ReversalModel:
-    def __init__(self, data, dt_idx='datetime', day_idx='date', params=None):
+    def __init__(self, data, dt_idx='datetime', day_idx='date', range_df=None, params=None):
 
         self.sec_df = data
         self.dt_idx = dt_idx
         self.day_idx = day_idx
+        self.range_df = range_df
 
         if params is None:
             self.params = {
@@ -212,6 +213,22 @@ class ReversalModel:
         
         min_df['dist_to_max'] = min_df.groupby(self.day_idx)['price'].transform(lambda x: x.max() - x)
         min_df['dist_to_min'] = min_df.groupby(self.day_idx)['price'].transform(lambda x: x - x.min())
+
+        def get_range_dists(group):
+            day = group['dt'].dt.date.iloc[-1]
+
+            pred_range_pct = self.range_df[self.range_df['Date'].dt.date==day]['Predicted_RangePct'].iloc[0] / 100.0
+
+            pred_range_high = group['price'].iloc[0] * (1 + pred_range_pct * 0.5)
+            pred_range_low = group['price'].iloc[0] * (1 - pred_range_pct * 0.5)
+
+            group['dist_to_max'] = (pred_range_high - group['price']) / group['price']
+            group['dist_to_min'] = (group['price'] - pred_range_low) / group['price']
+
+            return group
+
+        if self.range_df is not None:
+            min_df = min_df.groupby(self.day_idx, group_keys=False).apply(get_range_dists)
         
         return min_df
 
