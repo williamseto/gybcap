@@ -2,6 +2,10 @@
 from pred_util import *
 from datetime import datetime, time
 import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
 def sigmoid(x):
 	return 1 / (1 + np.exp(-x))
@@ -31,6 +35,43 @@ prob_rev, _ = rev_model.predict(rev_model.min_df)
 
 rev_model.bst.save_model('rev_model.json')
 # exit()
+
+seconds_labels_df = pd.merge_asof(
+    sec_df,
+    rev_model.min_df[['dt', 'y_rev']],
+    left_on='dt',
+    right_on='dt',
+    direction='backward'
+)
+
+rev_dataset = ReversalDataset(seconds_labels_df)
+
+loader = DataLoader(rev_dataset, batch_size=32, shuffle=True)
+
+# model setup
+device = torch.device('cpu')
+ae = TCNAutoencoder(in_ch=7).to(device)
+opt = torch.optim.Adam(ae.parameters(), lr=1e-3)
+loss_fn = nn.MSELoss()
+
+# train
+for epoch in range(1, 31):
+    train_loss = train_ae(ae, loader, opt, loss_fn, device)
+    print(f"Epoch {epoch:02d} - AE Loss: {train_loss:.6f}")
+
+# introspection
+latents, errors = compute_latent_and_error(ae, loader, device)
+# errors: low MSE means segment closely matches learned reversal manifold
+# latents: compressed representation of each reversal pattern
+
+# e.g., inspect error distribution
+print("Reconstruction error (mean ± std):", errors.mean(), errors.std())
+# find most/least typical patterns
+idx_sorted = np.argsort(errors)
+print("Top 5 most-typical reversal patterns indices:", idx_sorted[:5])
+print("Top 5 least-typical reversal patterns indices:", idx_sorted[-5:])
+
+exit()
 
 # min_df = rev_model.min_df
 # fd = min_df[min_df[day_idx]==min_df[day_idx].unique()[0]]

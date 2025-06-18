@@ -6,6 +6,10 @@ import matplotlib.pyplot as plt
 from scipy.stats import linregress
 from sklearn.model_selection import train_test_split
 
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
 def generate_second_data(start_date, num_days, seed_base=0):
     all_seconds = []
     for day_offset in range(num_days):
@@ -187,7 +191,7 @@ class ReversalModel:
         if params is None:
             self.params = {
                 'objective': 'binary:logistic',
-                'max_depth': 4,
+                'max_depth': 12,
                 'eta': 0.1,
                 'verbosity': 1
             }
@@ -196,7 +200,16 @@ class ReversalModel:
 
     def compute_minute_features(self, sec_df):
     
-        min_df = sec_df.set_index(self.dt_idx).groupby(self.day_idx).resample('1Min').agg({'price_s':'mean'}).bfill().reset_index()
+        # min_df = sec_df.set_index(self.dt_idx).groupby(self.day_idx).resample('1Min').agg({'price_s':'mean'}).bfill().reset_index()
+
+        agg_dict = {
+            'price_s': 'mean',
+            'TickDataSaver:Buys': 'sum',
+            'TickDataSaver:Sells': 'sum',
+            'Volume': 'sum'
+        }
+        min_df = sec_df.set_index(self.dt_idx).groupby(self.day_idx).resample('1Min').agg(agg_dict).bfill().reset_index()
+        min_df.rename(columns={'TickDataSaver:Buys': 'buys', 'TickDataSaver:Sells': 'sells'}, inplace=True)
 
         min_df.rename(columns={'price_s': 'price'}, inplace=True)
         min_df = min_df.groupby(self.day_idx, group_keys=False).apply(generate_strict_reversal_labels)
@@ -214,10 +227,26 @@ class ReversalModel:
         min_df['dist_to_max'] = min_df.groupby(self.day_idx)['price'].transform(lambda x: x.max() - x)
         min_df['dist_to_min'] = min_df.groupby(self.day_idx)['price'].transform(lambda x: x - x.min())
 
+        min_df['delta_m'] = (min_df['buys'] - min_df['sells'])
+        min_df['cum_delta_m'] = min_df.groupby(self.day_idx)['delta_m'].cumsum()
+
+        min_df['vol_20m_avg'] = min_df.groupby(self.day_idx)['Volume'].transform(lambda x: x.rolling(20).mean()).fillna(1)
+
+        min_df['buy_vol_pct'] = min_df['buys'] / min_df['vol_20m_avg']
+        min_df['sell_vol_pct'] = min_df['sells'] / min_df['vol_20m_avg']
+
+        min_df['curr_lod'] = min_df.groupby(self.day_idx)['price'].cummin()
+        min_df['curr_hod'] = min_df.groupby(self.day_idx)['price'].cummax()
+
+        min_df['dist_to_lod'] = min_df['price'] - min_df['curr_lod']
+        min_df['dist_to_hod'] = min_df['curr_hod'] - min_df['price']
+
         def get_range_dists(group):
             day = group['dt'].dt.date.iloc[-1]
 
             pred_range_pct = self.range_df[self.range_df['Date'].dt.date==day]['Predicted_RangePct'].iloc[0] / 100.0
+
+            # pred_range_pct = (group['price'].max() - group['price'].min()) / group['price'].iloc[0]
 
             pred_range_high = group['price'].iloc[0] * (1 + pred_range_pct * 0.5)
             pred_range_low = group['price'].iloc[0] * (1 - pred_range_pct * 0.5)
@@ -299,7 +328,7 @@ class ReversalModel:
 
     def _prepare_data(self, min_df):
         # features = ['ret_1m', 'ret_5m', 'vol_10m', 'min_to_close', 'vol_60s', 'flips_60s']
-        features = ['ret_1m', 'ret_5m', 'vol_10m', 'min_to_close', 'dist_to_max', 'dist_to_min']
+        features = ['ret_1m', 'ret_5m', 'vol_10m', 'min_to_close', 'dist_to_max', 'dist_to_min', 'delta_m', 'cum_delta_m', 'Volume', 'buy_vol_pct', 'sell_vol_pct', 'dist_to_lod', 'dist_to_hod']
         X = min_df[features].values
         y_rev = min_df['y_rev'].values
 
@@ -424,5 +453,120 @@ class UtilityModel:
         self.T_base = T_base
     
 
+class ReversalDataset(Dataset):
+
+    def __init__(self, df, back_bars=60, front_bars=15):
+        self.segments = []
 
 
+        feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'TickDataSaver:Buys', 'TickDataSaver:Sells']
+
+        N = len(df)
+        W = back_bars + front_bars + 1
+
+
+        def grab_window(row):
+            i = df.index.get_loc(row.name)
+            start, end = i-back_bars, i+front_bars+1
+
+            if start < 0 or end > len(df):
+                return None
+
+            if df.iloc[start]['trading_day'] != df.iloc[end]['trading_day']:
+                return None
+
+            ret = df.iloc[start:end][feature_cols].to_numpy().T
+
+            return ret
+
+        windows = (
+            df.loc[df['y_rev']==1]
+            .apply(grab_window, axis=1)
+            .dropna()
+            .tolist()
+        )
+        self.X = np.stack(windows, axis=0)
+
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, i):
+        return torch.tensor(self.X[i], dtype=torch.float32)
+
+
+# --- TCN Autoencoder definition -----------------------------------------
+class TCNBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation):
+        super().__init__()
+        pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size,
+                              padding=pad, dilation=dilation)
+        self.relu = nn.ReLU()
+        self.net = nn.Sequential(self.conv, self.relu)
+        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
+
+    def forward(self, x):
+        out = self.net(x)
+        out = out[:, :, :x.size(2)]
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+class TCNAutoencoder(nn.Module):
+    def __init__(self, in_ch=5, num_levels=4, kernel_size=3, hidden_ch=64):
+        super().__init__()
+        # encoder
+        enc_layers = []
+        chs = [in_ch] + [hidden_ch] * num_levels
+        for i in range(num_levels):
+            enc_layers.append(TCNBlock(chs[i], chs[i+1], kernel_size, dilation=2**i))
+        self.encoder = nn.Sequential(*enc_layers)
+        # bottleneck pooling
+        self.pool = nn.AdaptiveMaxPool1d(1)
+        # decoder: mirror of encoder
+        dec_layers = []
+        rev_chs = [hidden_ch] + list(reversed(chs[:-1]))
+        for i in range(num_levels):
+            dec_layers.append(
+                nn.ConvTranspose1d(rev_chs[i], rev_chs[i+1], kernel_size,
+                                   dilation=2**(num_levels-1-i),
+                                   padding=(kernel_size-1)*(2**(num_levels-1-i)))
+            )
+            dec_layers.append(nn.ReLU())
+        self.decoder = nn.Sequential(*dec_layers)
+
+    def forward(self, x):
+        # x: [B, C, L]
+        h = self.encoder(x)
+        z = self.pool(h)  # [B, hidden_ch, 1]
+        z_rep = z.repeat(1, 1, x.size(2))
+        x_rec = self.decoder(z_rep)
+        return x_rec, z.squeeze(-1)  # return reconstruction and latent
+    
+# --- Training & introspection -------------------------------------------
+
+def train_ae(model, loader, opt, loss_fn, device):
+    model.train()
+    total = 0
+    for X in loader:
+        X = X.to(device)
+        opt.zero_grad()
+        X_rec, _ = model(X)
+        loss = loss_fn(X_rec, X)
+        loss.backward()
+        opt.step()
+        total += loss.item() * X.size(0)
+    return total / len(loader.dataset)
+
+@torch.no_grad()
+def compute_latent_and_error(model, loader, device):
+    model.eval()
+    latents = []
+    errors = []
+    for X in loader:
+        X = X.to(device)
+        X_rec, z = model(X)
+        err = ((X_rec - X)**2).mean(dim=[1,2])  # MSE per sample
+        latents.append(z.cpu().numpy())
+        errors.append(err.cpu().numpy())
+    return np.vstack(latents), np.concatenate(errors)
