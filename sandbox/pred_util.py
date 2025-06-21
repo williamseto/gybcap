@@ -475,9 +475,13 @@ class ReversalDataset(Dataset):
             if df.iloc[start]['trading_day'] != df.iloc[end]['trading_day']:
                 return None
 
-            ret = df.iloc[start:end][feature_cols].to_numpy().T
+            segment = df.iloc[start:end][feature_cols].to_numpy().T
 
-            return ret
+            price_open = segment[0, 0]
+            segment[:4, :] = (segment[:4, :] - price_open) / price_open    # normalize all price channels by open
+            segment[4, :]  = np.log1p(segment[4, :])                       # log‑volume
+
+            return segment
 
         windows = (
             df.loc[df['y_rev']==1]
@@ -502,6 +506,9 @@ class TCNBlock(nn.Module):
         pad = (kernel_size - 1) * dilation
         self.conv = nn.Conv1d(in_ch, out_ch, kernel_size,
                               padding=pad, dilation=dilation)
+
+        self.conv = nn.Sequential(self.conv, nn.BatchNorm1d(out_ch))
+
         self.relu = nn.ReLU()
         self.net = nn.Sequential(self.conv, self.relu)
         self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
@@ -570,3 +577,180 @@ def compute_latent_and_error(model, loader, device):
         latents.append(z.cpu().numpy())
         errors.append(err.cpu().numpy())
     return np.vstack(latents), np.concatenate(errors)
+
+# ——— 0. Helpers: Local & Global Encoders —————————————
+class LocalTCNEncoder(nn.Module):
+    def __init__(self, in_ch=5, hidden_ch=64, levels=4):
+        super().__init__()
+        # same as your TCNClassifier’s encoder up to pooling
+        layers = []
+        chs = [in_ch] + [hidden_ch]*levels
+        for i in range(levels):
+            layers.append(TCNBlock(chs[i], chs[i+1], kernel_size=3, dilation=2**i))
+        self.net  = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveMaxPool1d(1)
+    def forward(self, x):
+        h = self.net(x)             # [B, hidden_ch, L]
+        z = self.pool(h).squeeze(-1)  # [B, hidden_ch]
+        return z
+
+class GlobalCNNEncoder(nn.Module):
+    def __init__(self, in_ch=5, hidden_ch=32):
+        super().__init__()
+        # assume global input is heavily downsampled (e.g. 30 bars of 1‑min OHLCV)
+        self.net = nn.Sequential(
+            nn.Conv1d(in_ch,  16, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv1d(16,     32, kernel_size=3, padding=1), nn.ReLU(),
+            nn.AdaptiveMaxPool1d(1)
+        )
+    def forward(self, x):
+        h = self.net(x)            # [B, 32, 1]
+        return h.squeeze(-1)       # [B, 32]
+
+# ——— 1. Fusion Heads —————————————————————————
+class MLPFusion(nn.Module):
+    def __init__(self, d1, d2, hidden=64, num_classes=2):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(d1+d2, hidden), nn.ReLU(),
+            nn.Linear(hidden, num_classes)
+        )
+    def forward(self, z1, z2):
+        return self.fc(torch.cat([z1, z2], dim=1))
+
+class AttentionFusion(nn.Module):
+    def __init__(self, d_query, d_kv, d_model=64, num_classes=2):
+        super().__init__()
+        self.q_proj = nn.Linear(d_query, d_model, bias=False)
+        self.k_proj = nn.Linear(d_kv,    d_model, bias=False)
+        self.v_proj = nn.Linear(d_kv,    d_model, bias=False)
+        self.out    = nn.Linear(d_model + d_query, num_classes)
+    def forward(self, z_local, z_global):
+        # [B, d_model]
+        q = self.q_proj(z_local)         # query
+        k = self.k_proj(z_global)        # key
+        v = self.v_proj(z_global)        # value
+        # scalar attention score for each sample
+        attn = torch.softmax((q * k).sum(dim=1, keepdim=True) / (q.size(1)**0.5), dim=1)
+        # fuse: weighted global info
+        z_attn = attn * v                # [B, d_model]
+        # final logits
+        return self.out(torch.cat([z_local, z_attn], dim=1))
+
+# ——— 2. Two‑Stream Wrapper ——————————————————————
+class TwoStreamModel(nn.Module):
+    def __init__(self, local_enc, global_enc, fusion_head):
+        super().__init__()
+        self.local_enc  = local_enc
+        self.global_enc = global_enc
+        self.fusion     = fusion_head
+    def forward(self, x_local, x_global):
+        z1 = self.local_enc(x_local)
+        z2 = self.global_enc(x_global)
+        return self.fusion(z1, z2)
+
+
+from sklearn.metrics import accuracy_score
+
+def train_twostream_epoch(model, loader, opt, loss_fn, device):
+    model.train()
+    total_loss = 0
+    all_preds, all_y = [], []
+    for x_loc, x_glo, y in loader:
+        x_loc, x_glo, y = x_loc.to(device), x_glo.to(device), y.to(device)
+        opt.zero_grad()
+        logits = model(x_loc, x_glo)
+        loss   = loss_fn(logits, y)
+        loss.backward(); opt.step()
+        total_loss += loss.item() * y.size(0)
+        all_preds.append(logits.argmax(1).cpu())
+        all_y.append(y.cpu())
+    preds = torch.cat(all_preds)
+    truth = torch.cat(all_y)
+    return total_loss/len(truth), accuracy_score(truth, preds)
+
+@torch.no_grad()
+def eval_twostream_model(model, loader, device):
+    model.eval()
+    all_preds, all_y = [], []
+    for x_loc, x_glo, y in loader:
+        x_loc, x_glo, y = x_loc.to(device), x_glo.to(device), y.to(device)
+        logits = model(x_loc, x_glo)
+        all_preds.append(logits.argmax(1).cpu())
+        all_y.append(y.cpu())
+    preds = torch.cat(all_preds)
+    truth = torch.cat(all_y)
+    return accuracy_score(truth, preds)
+
+class TwoStreamReversalDataset(Dataset):
+
+    def __init__(self, sec_df, min_df):
+        self.segments = []
+
+        feature_cols = ['Close', 'Volume', 'TickDataSaver:Buys', 'TickDataSaver:Sells']
+
+        min_feature_cols = ['price', 'Volume', 'buys', 'sells']
+
+        def normalize_price(segment):
+            mean_price = np.mean(segment[0, :])
+            std_price = np.maximum(np.std(segment[0, :]), 1e-6)
+            segment[0, :] = (segment[0, :] - mean_price) / std_price  # z‑score price
+
+            segment[1:, :]  = np.log1p(segment[1:, :])                       # log‑volume
+
+            segment[1, :] = (segment[1, :] - np.mean(segment[1, :])) / (np.std(segment[1, :]) + 1e-6)  # z‑score volume
+            segment[2, :] = (segment[2, :] - np.mean(segment[2, :])) / (np.std(segment[2, :]) + 1e-6)  # z‑score buys
+            segment[3, :] = (segment[3, :] - np.mean(segment[3, :])) / (np.std(segment[3, :]) + 1e-6)  # z‑score sells
+
+            return segment
+
+
+        def grab_window(row):
+            i = sec_df.index.get_loc(row.name)
+            start = i - 60
+            end = i + 15 + 1
+
+            if start < 0 or end > len(sec_df) - 1:
+                return None
+
+            if sec_df.iloc[start]['trading_day'] != sec_df.iloc[end]['trading_day']:
+                return None
+
+            dt_sec = sec_df.iloc[start]['dt'].floor('min')
+
+            row_min = min_df.loc[min_df['dt'] == dt_sec]
+            if row_min.empty:
+                return None
+
+            min_idx = row_min.index[0]
+            start_min = min_idx - 30
+
+            if start_min < 0:
+                return None
+
+            global_segment = min_df.iloc[start_min:min_idx][min_feature_cols].to_numpy().T
+
+            global_segment = normalize_price(global_segment)
+
+
+            local_segment = sec_df.iloc[start:end][feature_cols].to_numpy().T
+
+            local_segment = normalize_price(local_segment)
+
+            label = sec_df.iloc[i]['y_rev']
+
+
+            return local_segment, global_segment, label
+
+        local_windows, global_windows, labels = zip(*sec_df.apply(grab_window, axis=1).dropna())
+
+        self.X_local = np.stack(local_windows, axis=0)
+        self.X_global = np.stack(global_windows, axis=0)
+        self.y = np.stack(labels, axis=0)
+
+
+    def __len__(self):
+        return len(self.X_local)
+
+    def __getitem__(self, i):
+        return torch.tensor(self.X_local[i], dtype=torch.float32), torch.tensor(self.X_global[i], dtype=torch.float32), torch.tensor(self.y[i], dtype=torch.Long)
