@@ -692,25 +692,15 @@ class TwoStreamReversalDataset(Dataset):
     def __init__(self, sec_df, min_df):
         self.segments = []
 
-        feature_cols = ['Close', 'Volume', 'TickDataSaver:Buys', 'TickDataSaver:Sells']
+        self.feature_cols = ['Close', 'Volume', 'TickDataSaver:Buys', 'TickDataSaver:Sells']
 
-        min_feature_cols = ['price', 'Volume', 'buys', 'sells']
+        self.min_feature_cols = ['price', 'Volume', 'buys', 'sells']
 
-        def normalize_price(segment):
-            mean_price = np.mean(segment[0, :])
-            std_price = np.maximum(np.std(segment[0, :]), 1e-6)
-            segment[0, :] = (segment[0, :] - mean_price) / std_price  # z‑score price
-
-            segment[1:, :]  = np.log1p(segment[1:, :])                       # log‑volume
-
-            segment[1, :] = (segment[1, :] - np.mean(segment[1, :])) / (np.std(segment[1, :]) + 1e-6)  # z‑score volume
-            segment[2, :] = (segment[2, :] - np.mean(segment[2, :])) / (np.std(segment[2, :]) + 1e-6)  # z‑score buys
-            segment[3, :] = (segment[3, :] - np.mean(segment[3, :])) / (np.std(segment[3, :]) + 1e-6)  # z‑score sells
-
-            return segment
+        self.sec_df = sec_df
+        self.min_df = min_df
 
 
-        def grab_window(row):
+        def get_indices(row):
             i = sec_df.index.get_loc(row.name)
             start = i - 60
             end = i + 15 + 1
@@ -733,29 +723,67 @@ class TwoStreamReversalDataset(Dataset):
             if start_min < 0:
                 return None
 
-            global_segment = min_df.iloc[start_min:min_idx][min_feature_cols].to_numpy().T
+            return row.name
 
-            global_segment = normalize_price(global_segment)
-
-
-            local_segment = sec_df.iloc[start:end][feature_cols].to_numpy().T
-
-            local_segment = normalize_price(local_segment)
-
-            label = sec_df.iloc[i]['y_rev']
+        self.indices = sec_df.apply(get_indices, axis=1).dropna()
 
 
-            return local_segment, global_segment, label
+    def normalize_price(self, segment):
+        mean_price = np.mean(segment[0, :])
+        std_price = np.maximum(np.std(segment[0, :]), 1e-6)
+        segment[0, :] = (segment[0, :] - mean_price) / std_price  # z‑score price
 
-        local_windows, global_windows, labels = zip(*sec_df.apply(grab_window, axis=1).dropna())
+        segment[1:, :]  = np.log1p(segment[1:, :])                       # log‑volume
 
-        self.X_local = np.stack(local_windows, axis=0)
-        self.X_global = np.stack(global_windows, axis=0)
-        self.y = np.stack(labels, axis=0)
+        segment[1, :] = (segment[1, :] - np.mean(segment[1, :])) / (np.std(segment[1, :]) + 1e-6)  # z‑score volume
+        segment[2, :] = (segment[2, :] - np.mean(segment[2, :])) / (np.std(segment[2, :]) + 1e-6)  # z‑score buys
+        segment[3, :] = (segment[3, :] - np.mean(segment[3, :])) / (np.std(segment[3, :]) + 1e-6)  # z‑score sells
 
+        return segment
+
+
+    def grab_window(self, row_idx):
+        i = int(row_idx)
+        start = i - 60
+        end = i + 15 + 1
+
+        if start < 0 or end > len(self.sec_df) - 1:
+            return None
+
+        if self.sec_df.iloc[start]['trading_day'] != self.sec_df.iloc[end]['trading_day']:
+            return None
+
+        dt_sec = self.sec_df.iloc[start]['dt'].floor('min')
+
+        row_min = self.min_df.loc[self.min_df['dt'] == dt_sec]
+        if row_min.empty:
+            return None
+
+        min_idx = row_min.index[0]
+        start_min = min_idx - 30
+
+        if start_min < 0:
+            return None
+
+        global_segment = self.min_df.iloc[start_min:min_idx][self.min_feature_cols].to_numpy().T
+
+        global_segment = self.normalize_price(global_segment)
+
+
+        local_segment = self.sec_df.iloc[start:end][self.feature_cols].to_numpy().T
+
+        local_segment = self.normalize_price(local_segment)
+
+        label = self.sec_df.iloc[i]['y_rev']
+
+
+        return local_segment, global_segment, label
 
     def __len__(self):
-        return len(self.X_local)
+        return len(self.indices)
 
     def __getitem__(self, i):
-        return torch.tensor(self.X_local[i], dtype=torch.float32), torch.tensor(self.X_global[i], dtype=torch.float32), torch.tensor(self.y[i], dtype=torch.long)
+
+        local_window, global_window, label = self.grab_window(self.indices.iloc[i])
+
+        return torch.tensor(local_window, dtype=torch.float32), torch.tensor(global_window, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
