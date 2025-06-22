@@ -9,6 +9,7 @@ from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
 def generate_second_data(start_date, num_days, seed_base=0):
     all_seconds = []
@@ -244,7 +245,11 @@ class ReversalModel:
         def get_range_dists(group):
             day = group['dt'].dt.date.iloc[-1]
 
-            pred_range_pct = self.range_df[self.range_df['Date'].dt.date==day]['Predicted_RangePct'].iloc[0] / 100.0
+            try:
+                pred_range_pct = self.range_df[self.range_df['Date'].dt.date==day]['Predicted_RangePct'].iloc[0] / 100.0
+            except:
+                # If no range data available for this day, use a default value
+                pred_range_pct = 0.005
 
             # pred_range_pct = (group['price'].max() - group['price'].min()) / group['price'].iloc[0]
 
@@ -753,4 +758,4 @@ class TwoStreamReversalDataset(Dataset):
         return len(self.X_local)
 
     def __getitem__(self, i):
-        return torch.tensor(self.X_local[i], dtype=torch.float32), torch.tensor(self.X_global[i], dtype=torch.float32), torch.tensor(self.y[i], dtype=torch.Long)
+        return torch.tensor(self.X_local[i], dtype=torch.float32), torch.tensor(self.X_global[i], dtype=torch.float32), torch.tensor(self.y[i], dtype=torch.long)
