@@ -7,6 +7,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+device = torch.device('cpu')
+
+if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+    device = torch.device("mps")
+
 def sigmoid(x):
 	return 1 / (1 + np.exp(-x))
 
@@ -19,7 +24,8 @@ data_filename = '../test_seconds_td0.csv'
 sec_df = pd.read_csv(data_filename)
 
 dt_format_str = "%m/%d/%Y %H:%M:%S"
-sec_df['dt'] = sec_df.apply(lambda row: datetime.strptime(f"{row['Date']} {row['Time']}", dt_format_str), axis=1)
+# sec_df['dt'] = sec_df.apply(lambda row: datetime.strptime(f"{row['Date']} {row['Time']}", dt_format_str), axis=1)
+sec_df['dt'] = pd.to_datetime(sec_df['Date'] + ' ' + sec_df['Time'], format=dt_format_str)
 
 sec_df['price_s'] = sec_df['Close']
 
@@ -29,12 +35,6 @@ day_idx = 'trading_day'
 rev_model = ReversalModel(sec_df, dt_idx=dt_idx, day_idx=day_idx, range_df=range_df)
 
 rev_model_features = rev_model.compute_features()
-rev_model.train()
-
-prob_rev, _ = rev_model.predict(rev_model.min_df)
-
-rev_model.bst.save_model('rev_model.json')
-# exit()
 
 seconds_labels_df = pd.merge_asof(
     sec_df,
@@ -44,74 +44,26 @@ seconds_labels_df = pd.merge_asof(
     direction='backward'
 )
 
-device = torch.device('cpu')
+full_ds = TwoStreamReversalDatasetVec(seconds_labels_df, rev_model.min_df)
 
-full_ds = TwoStreamReversalDataset(seconds_labels_df, rev_model.min_df)
+loader = DataLoader(full_ds, batch_size=32)
 
-loader = DataLoader(full_ds, batch_size=32, shuffle=True)
+ml_rev_model = TwoStreamReversalModel(device)
 
-# architect parameters
-d1, d2 = 64, 32    # local hidden_ch, global hidden_ch
+seconds_labels_df['ml_pred_rev'] = ml_rev_model.predict(loader, len(seconds_labels_df))
 
-# instantiate two models
-mlp_model = TwoStreamModel(
-    LocalTCNEncoder(in_ch=4, hidden_ch=d1),
-    GlobalCNNEncoder(in_ch=4, hidden_ch=d2),
-    MLPFusion(d1, d2)
-).to(device)
+seconds_labels_df[['Date','Time','Open','High','Low','Close','Volume','TickDataSaver:Buys','TickDataSaver:Sells','ovn','trading_day','ml_pred_rev']].to_csv('test_sec.csv', index=False)
+exit()
 
-# attn_model = TwoStreamModel(
-#     LocalTCNEncoder(in_ch=5, hidden_ch=d1),
-#     GlobalCNNEncoder(in_ch=5, hidden_ch=d2),
-#     AttentionFusion(d1, d2)
-# ).to(device)
+# rev_model.min_df['ml_pred_rev'] = seconds_labels_df.set_index('dt').groupby('trading_day').resample('1Min').agg({'ml_pred_rev':'last'}).reset_index()['ml_pred_rev']
 
-# training setup
-loss_fn = nn.CrossEntropyLoss()
-optim_mlp  = torch.optim.Adam(mlp_model.parameters(),  lr=1e-3)
-# optim_attn = torch.optim.Adam(attn_model.parameters(), lr=1e-3)
+rev_model.train()
 
-# train both for a few epochs
-for epoch in range(1, 31):
-    mlp_loss, mlp_acc = train_twostream_epoch(mlp_model, loader, optim_mlp, loss_fn, device)
-    # val_acc_mlp      = eval_model(mlp_model, val_loader, device)
+prob_rev, _ = rev_model.predict(rev_model.min_df)
 
-    print(f"Epoch {epoch:02d} | MLP ▶ train_loss={mlp_loss:.3f}, acc={mlp_acc:.3f}")
+rev_model.bst.save_model('rev_model.json')
 
-    # att_loss, att_acc = train_epoch(attn_model, train_loader, optim_attn, loss_fn, device)
-    # val_acc_attn      = eval_model(attn_model, val_loader, device)
-
-    # print(f"Epoch {epoch:02d} | "
-    #       f"MLP ▶ train_loss={mlp_loss:.3f}, val_acc={val_acc_mlp:.3f} | "
-    #       f"ATT ▶ train_loss={att_loss:.3f}, val_acc={val_acc_attn:.3f}")
-
-# rev_dataset = ReversalDataset(seconds_labels_df)
-
-# loader = DataLoader(rev_dataset, batch_size=32, shuffle=True)
-
-# # model setup
-# ae = TCNAutoencoder(in_ch=7).to(device)
-# opt = torch.optim.Adam(ae.parameters(), lr=1e-3)
-# loss_fn = nn.MSELoss()
-
-# # train
-# for epoch in range(1, 31):
-#     train_loss = train_ae(ae, loader, opt, loss_fn, device)
-#     print(f"Epoch {epoch:02d} - AE Loss: {train_loss:.6f}")
-
-# # introspection
-# latents, errors = compute_latent_and_error(ae, loader, device)
-# # errors: low MSE means segment closely matches learned reversal manifold
-# # latents: compressed representation of each reversal pattern
-
-# # e.g., inspect error distribution
-# print("Reconstruction error (mean ± std):", errors.mean(), errors.std())
-# # find most/least typical patterns
-# idx_sorted = np.argsort(errors)
-# print("Top 5 most-typical reversal patterns indices:", idx_sorted[:5])
-# print("Top 5 least-typical reversal patterns indices:", idx_sorted[-5:])
-
-# exit()
+exit()
 
 # min_df = rev_model.min_df
 # fd = min_df[min_df[day_idx]==min_df[day_idx].unique()[0]]

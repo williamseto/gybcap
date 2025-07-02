@@ -200,8 +200,6 @@ class ReversalModel:
             self.params = params
 
     def compute_minute_features(self, sec_df):
-    
-        # min_df = sec_df.set_index(self.dt_idx).groupby(self.day_idx).resample('1Min').agg({'price_s':'mean'}).bfill().reset_index()
 
         agg_dict = {
             'price_s': 'mean',
@@ -333,7 +331,7 @@ class ReversalModel:
 
     def _prepare_data(self, min_df):
         # features = ['ret_1m', 'ret_5m', 'vol_10m', 'min_to_close', 'vol_60s', 'flips_60s']
-        features = ['ret_1m', 'ret_5m', 'vol_10m', 'min_to_close', 'dist_to_max', 'dist_to_min', 'delta_m', 'cum_delta_m', 'Volume', 'buy_vol_pct', 'sell_vol_pct', 'dist_to_lod', 'dist_to_hod']
+        features = ['ret_1m', 'ret_5m', 'vol_10m', 'min_to_close', 'dist_to_max', 'dist_to_min', 'delta_m', 'cum_delta_m', 'Volume', 'buy_vol_pct', 'sell_vol_pct', 'dist_to_lod', 'dist_to_hod', 'ml_pred_rev']
         X = min_df[features].values
         y_rev = min_df['y_rev'].values
 
@@ -699,7 +697,6 @@ class TwoStreamReversalDataset(Dataset):
         self.sec_df = sec_df
         self.min_df = min_df
 
-
         def get_indices(row):
             i = sec_df.index.get_loc(row.name)
             start = i - 60
@@ -711,7 +708,7 @@ class TwoStreamReversalDataset(Dataset):
             if sec_df.iloc[start]['trading_day'] != sec_df.iloc[end]['trading_day']:
                 return None
 
-            dt_sec = sec_df.iloc[start]['dt'].floor('min')
+            dt_sec = sec_df.iloc[i]['dt'].floor('min')
 
             row_min = min_df.loc[min_df['dt'] == dt_sec]
             if row_min.empty:
@@ -721,6 +718,9 @@ class TwoStreamReversalDataset(Dataset):
             start_min = min_idx - 30
 
             if start_min < 0:
+                return None
+            
+            if min_df.iloc[start_min]['trading_day'] != min_df.iloc[min_idx]['trading_day']:
                 return None
 
             return row.name
@@ -753,7 +753,7 @@ class TwoStreamReversalDataset(Dataset):
         if self.sec_df.iloc[start]['trading_day'] != self.sec_df.iloc[end]['trading_day']:
             return None
 
-        dt_sec = self.sec_df.iloc[start]['dt'].floor('min')
+        dt_sec = self.sec_df.iloc[i]['dt'].floor('min')
 
         row_min = self.min_df.loc[self.min_df['dt'] == dt_sec]
         if row_min.empty:
@@ -787,3 +787,190 @@ class TwoStreamReversalDataset(Dataset):
         local_window, global_window, label = self.grab_window(self.indices.iloc[i])
 
         return torch.tensor(local_window, dtype=torch.float32), torch.tensor(global_window, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+
+
+from numpy.lib.stride_tricks import sliding_window_view
+
+class TwoStreamReversalDatasetVec(Dataset):
+
+    def __init__(self, sec_df, min_df):
+
+        self.sec_df = sec_df
+        self.min_df = min_df
+        
+        self.sec_df['price'] = self.sec_df['Close']
+        self.sec_df['Volume'] = self.sec_df['Volume']
+        self.sec_df['buys'] = self.sec_df['TickDataSaver:Buys']
+        self.sec_df['sells'] = self.sec_df['TickDataSaver:Sells']
+
+        self.L_sec = 60 + 15 + 1
+        self.L_min = 30
+
+        self.sec_df = self.precompute_norms(self.sec_df, self.L_sec)
+        self.min_df = self.precompute_norms(self.min_df, self.L_min)
+
+        self.norm_feature_cols = ['price_z', 'vol_z', 'buys_z', 'sells_z']
+
+        self.feature_cols = ['Close', 'Volume', 'TickDataSaver:Buys', 'TickDataSaver:Sells']
+
+        self.min_feature_cols = ['price', 'Volume', 'buys', 'sells']
+
+        self.precompute_windows()
+
+    def precompute_norms(self, df, L_window):
+
+        # 1a) price: rolling mean/std over the same length & centered
+        df['price_mean'] = df['price'].rolling(window=L_window, center=True, min_periods=1).mean()
+        df['price_std']  = df['price'].rolling(window=L_window, center=True, min_periods=1).std().clip(lower=1e-6)
+        
+        # 1b) log-1p volume & then its rolling mean/std
+        df['log_vol'] = np.log1p(df['Volume'])
+        df['vol_mean'] = df['log_vol'].rolling(window=L_window, center=True, min_periods=1).mean()
+        df['vol_std']  = df['log_vol'].rolling(window=L_window, center=True, min_periods=1).std().add(1e-6)
+
+        # 1c) same for buys & sells
+        for col in ['buys', 'sells']:
+            df[f'{col}_mean'] = df[col].rolling(window=L_window, center=True, min_periods=1).mean()
+            df[f'{col}_std'] = df[col].rolling(window=L_window, center=True, min_periods=1).std().add(1e-6)
+
+        # price z-score
+        df['price_z'] = (df['price'] - df['price_mean']) / df['price_std']
+
+        # volume z-score of log1p(vol)
+        df['vol_z']   = (df['log_vol'] - df['vol_mean']) / df['vol_std']
+
+        # buys & sells z-scores
+        for col in ['buys','sells']:
+            df[f'{col}_z'] = (df[col] - df[f'{col}_mean']) / df[f'{col}_std']
+
+        return df
+            
+
+    def precompute_windows(self):
+        # 1) Pull out raw arrays once
+        sec_arr   = self.sec_df[self.norm_feature_cols].to_numpy()            # (N_sec, D_sec)
+        min_arr   = self.min_df[self.norm_feature_cols].to_numpy()        # (N_min, D_min)
+        td_sec    = self.sec_df['trading_day'].to_numpy()                # (N_sec,)
+        td_min    = self.min_df['trading_day'].to_numpy()                # (N_min,)
+        dt_floor  = self.sec_df['dt'].dt.floor('min')
+        y_rev_all = self.sec_df['y_rev'].to_numpy()
+
+        # 2) Minute‐index lookup
+        minute_indexer = pd.Series(np.arange(len(self.min_df)), index=self.min_df['dt'])
+        sec_min_idx = dt_floor.map(minute_indexer).to_numpy()  # (N_sec,)
+
+        # 3) Build sliding‐window **views**
+        L_local  = self.L_sec
+
+        sec_w    = sliding_window_view(sec_arr, window_shape=L_local, axis=0)
+        #   sec_w[i] covers sec_arr[i : i+L_local];
+        #   we want windows centered on original row i+60, so shift:
+        sec_w    = sec_w[60 : sec_arr.shape[0] - 15]           # shape (N_centered, L_local, D_sec)
+        # aligns center→second-row
+
+        L_global = self.L_min
+        min_w    = sliding_window_view(min_arr, window_shape=L_global, axis=0)  # (N_min - 29, 30, D_min)
+
+        # 4) Compute for each centered‐window its minute‐window start index
+        # idx      = np.arange(0, sec_arr.shape[0] - 16)        # maps sec_w → original row i
+        idx = np.arange(0, sec_w.shape[0] - 61)
+        starts   = sec_min_idx[idx] - L_global                # desired min-window start
+        ends     = sec_min_idx[idx]                          # end_min (exclusive) index
+
+
+        # Mask 1: must lie in bounds of minute‐windows
+        valid_gl = (starts >= 0) & (starts < min_w.shape[0])  # valid minute‐windows
+
+        # Mask 2: seconds‐window day‐boundary check (same as before)
+        same_day_sec = (td_sec[idx - 60] == td_sec[idx + 16])
+
+        # Mask 3: **new** minute‐window day‐boundary check
+        #          trading_day at start_min must equal at end_min
+        same_day_min = (td_min[starts] == td_min[ends])
+
+        # Combine all masks
+        valid = valid_gl & same_day_sec & same_day_min
+
+        self.valid_idx = np.nonzero(valid)[0]                       # indices into sec_w/min_w/idx arrays
+
+        # tst_dbg = self.sec_df.iloc[self.valid_idx]
+        # tst_dbg.to_csv('tst_dbg.csv')
+
+        # 7) Precompute raw labels aligned to sec_w
+        self.labels_base = y_rev_all[idx]                          # length N_centered
+
+        self.starts = starts
+        self.sec_w = sec_w
+        self.min_w = min_w
+
+
+    def __len__(self):
+        return len(self.valid_idx)
+
+    def __getitem__(self, i):
+        idx = self.valid_idx[i]
+        local_chunk = self.sec_w[idx]
+        global_chunk = self.min_w[self.starts[idx]]
+        label = self.labels_base[idx]
+        
+        return torch.tensor(local_chunk, dtype=torch.float32), torch.tensor(global_chunk, dtype=torch.float32), torch.tensor(label, dtype=torch.long), idx
+
+class TwoStreamReversalModel:
+    def __init__(self, device):
+
+        # architect parameters
+        d1, d2 = 64, 32    # local hidden_ch, global hidden_ch
+
+        # instantiate two models
+        self.mlp_model = TwoStreamModel(
+            LocalTCNEncoder(in_ch=4, hidden_ch=d1),
+            GlobalCNNEncoder(in_ch=4, hidden_ch=d2),
+            MLPFusion(d1, d2)
+        ).to(device)
+
+        # attn_model = TwoStreamModel(
+        #     LocalTCNEncoder(in_ch=5, hidden_ch=d1),
+        #     GlobalCNNEncoder(in_ch=5, hidden_ch=d2),
+        #     AttentionFusion(d1, d2)
+        # ).to(device)
+
+        # training setup
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.optim_mlp  = torch.optim.Adam(self.mlp_model.parameters(),  lr=1e-3)
+        # optim_attn = torch.optim.Adam(attn_model.parameters(), lr=1e-3)
+
+        self.device = device
+
+    def load_model(self, path):
+        self.mlp_model.load_state_dict(torch.load(path, map_location=self.device))
+
+
+    def train(self, loader):
+        for epoch in range(1, 31):
+            mlp_loss, mlp_acc = train_twostream_epoch(self.mlp_model, loader, self.optim_mlp, self.loss_fn, self.device)
+            # val_acc_mlp      = eval_model(mlp_model, val_loader, device)
+
+            print(f"Epoch {epoch:02d} | MLP ▶ train_loss={mlp_loss:.3f}, acc={mlp_acc:.3f}")
+
+            # att_loss, att_acc = train_epoch(attn_model, train_loader, optim_attn, loss_fn, device)
+            # val_acc_attn      = eval_model(attn_model, val_loader, device)
+
+            # print(f"Epoch {epoch:02d} | "
+            #       f"MLP ▶ train_loss={mlp_loss:.3f}, val_acc={val_acc_mlp:.3f} | "
+            #       f"ATT ▶ train_loss={att_loss:.3f}, val_acc={val_acc_attn:.3f}")
+        
+        torch.save(self.mlp_model.state_dict(), 'twostream_mlp_model.pth')
+
+    def predict(self, loader, pred_len):
+        all_probs = torch.zeros(pred_len)
+
+        self.mlp_model.eval()
+        with torch.no_grad():
+            for x_loc, x_glo, y, idx_batch in loader:
+                print(idx_batch[0].item())
+                x_loc, x_glo, y = x_loc.to(self.device), x_glo.to(self.device), y.to(self.device)
+                logits  = self.mlp_model(x_loc, x_glo)
+                probs  = F.softmax(logits, dim=1)[:,1].cpu()
+                all_probs[idx_batch] = probs
+
+        return all_probs.numpy()
