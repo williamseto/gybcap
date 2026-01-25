@@ -236,7 +236,7 @@ def process_dbn_chunked(args):
     # start_date = today - relativedelta(years=3, months=2)
 
     # start_date = datetime.strptime("10/01/2022", "%m/%d/%Y").date()
-    # today = datetime.strptime("03/31/2023", "%m/%d/%Y").date()
+    # today = datetime.strptime("04/01/2023", "%m/%d/%Y").date()
 
     start_date = datetime.strptime("04/01/2023", "%m/%d/%Y").date()
     today = datetime.strptime("10/31/2025", "%m/%d/%Y").date()
@@ -309,31 +309,35 @@ def process_dbn_chunked(args):
 
 
         # remove rows where open_interest is 0
-        stats_df = stats_df[~((stats_df["stat_name"] == "open_interest") & (stats_df["stat_value"] == 0))]
+        # stats_df = stats_df[~((stats_df["stat_name"] == "open_interest") & (stats_df["stat_value"] == 0))]
 
         # Groupby and keep the last published record for each statistic
-        stats_df = stats_df.groupby(["trade_date", "symbol", "stat_type"], as_index=False).agg('last').sort_values(["trade_date", "instrument_id"])
-        
-        keep_cols = [
-            c for c in [
-                "trade_date",
-                "symbol",
-                "instrument_id",
-                "stat_type",
-                "open_interest",
-                "cleared_volume",
-                "close_price",
-                "ts_event_ts",
-                "stat_value",
-                "stat_name",
-                "highest_bid",
-                "lowest_offer",
-            ] if c in stats_df.columns
-        ]
-        stats_df = stats_df[keep_cols]
+        # stats_df = stats_df.groupby(["trade_date", "symbol", "stat_type"], as_index=False).agg('last').sort_values(["trade_date", "instrument_id"])
+
+        # keep_cols = [
+        #     c for c in [
+        #         "trade_date",
+        #         "symbol",
+        #         "instrument_id",
+        #         "stat_type",
+        #         "open_interest",
+        #         "cleared_volume",
+        #         "close_price",
+        #         "ts_event_ts",
+        #         "stat_value",
+        #         "stat_name",
+        #         "highest_bid",
+        #         "lowest_offer",
+        #     ] if c in stats_df.columns
+        # ]
+        # stats_df = stats_df[keep_cols]
 
 
-        pivot_df = stats_df.pivot_table(index=["trade_date", "symbol"], columns="stat_name", values="stat_value", aggfunc="last").reset_index()
+        # pivot_df = stats_df.pivot_table(index=["trade_date", "symbol"], columns="stat_name", values="stat_value", aggfunc="last").reset_index()
+
+        oi_pivot_df = stats_df[stats_df["stat_name"] == "open_interest"].pivot_table(index=["trade_date", "symbol"], columns="stat_name", values="stat_value", aggfunc="max").reset_index()
+        other_pivot_df = stats_df[stats_df["stat_name"] != "open_interest"].pivot_table(index=["trade_date", "symbol"], columns="stat_name", values="stat_value", aggfunc="last").reset_index()
+        pivot_df = pd.merge(oi_pivot_df, other_pivot_df, on=["trade_date", "symbol"], how="left")
 
         pivot_df["open_interest"] = pivot_df["open_interest"].fillna(0)
    
@@ -377,7 +381,7 @@ def process_dbn_chunked(args):
 
         pivot_df["years_to_expiration"] = (pivot_df["expiration"] - pivot_df["trade_date"]).dt.days / 365
 
-        pivot_df['midprice'] = (pivot_df['highest_bid'] + pivot_df['lowest_offer']) / 2 
+        pivot_df['midprice'] = np.maximum(pivot_df['close_price'], (pivot_df['highest_bid'] + pivot_df['lowest_offer']) / 2)
 
         merged_df = pd.merge(pivot_df, spx_data, left_on="trade_date", right_index=True, how="left")
         merged_df.rename(columns={"Close": "underlying_price"}, inplace=True)
@@ -558,8 +562,9 @@ if __name__ == "__main__":
 
     # dbn_to_parquet(args.directory)
 
+    # merge_gamma_shares_parquets()
+    # inspect_parquet("gamma_shares_combined.parquet")
 
-
-    inspect_parquet("gamma_shares_2025.parquet")
+    # inspect_parquet("gamma_shares_2025.parquet")
 
     # inspect_parquet("oi_table.parquet")
