@@ -14,6 +14,7 @@ import pandas as pd
 import yfinance as yf
 import math
 from scipy.stats import norm
+import gex_utils
 
 # ---- Black-Scholes helpers (per-share) ----
 def bs_d1(S, K, r, sigma, T):
@@ -482,74 +483,40 @@ def merge_gamma_shares_parquets():
             writer.write_table(pq.read_table(file, schema=schema))
 
 def merge_gamma_stats_with_es_data():
-    gamma_shares_path = "gamma_shares_combined.parquet"
+
     es_data_path = "../raw_data/es_min_3y_clean_td.csv"
 
+    raw_df = pd.read_csv(es_data_path)
 
-    gamma_df = pd.read_parquet(gamma_shares_path)
-    gamma_df['trade_date'] = pd.to_datetime(gamma_df['trade_date'])
+    es_data_df = raw_df.copy()
 
+    dt_format_str = "%m/%d/%Y %H:%M:%S"
+    es_data_df['dt'] = pd.to_datetime(es_data_df['Date'] + ' ' + es_data_df['Time'], format=dt_format_str)
+    es_data_df.columns = es_data_df.columns.str.lower()
 
-    es_data_df = pd.read_csv(es_data_path)
-    es_data_df['Date'] = pd.to_datetime(es_data_df['Date'])
-
-
-    spx_data = yf.download("^GSPC", start=gamma_df.iloc[0]['trade_date'].date(), end=gamma_df.iloc[-1]['trade_date'].date())
-    spx_data.columns = spx_data.columns.droplevel(1)
-    spx_data = spx_data["Open"]
-
-
-    spx_price_adj = 0
+    iv_mapper = gex_utils.IVMapper()
 
     def compute_gamma_stats(group):
-        trade_date = group.iloc[-1]['Date']
 
-        prev_trade_date = trade_date - pd.tseries.offsets.BDay(1)
+        if group.empty:
+            return 0
 
-        print("processing trade date: ", prev_trade_date.strftime('%Y-%m-%d'))
+        trade_date = group.iloc[-1]['date']
 
-        gamma_day_df = gamma_df[gamma_df["trade_date"] == prev_trade_date]
+        time_df = group.set_index("dt")
+        rth_idx = group.index[time_df.index.indexer_between_time('6:30', '12:59')]
+        rth_df = time_df.between_time('6:30', '12:59')
 
-        global spx_price_adj
-        try:
-            spx_open_price = spx_data.loc[trade_date.strftime('%Y-%m-%d')]
-            es_open_price = group[group["Time"] == "06:30:00"]["Open"].values[0]
-
-            spx_price_adj = spx_open_price - es_open_price
-        except Exception as e:
-            pass
-
-
-        strikes = gamma_day_df["strike"].to_numpy()
-
-        es_closes_adj = group["Close"].to_numpy() + spx_price_adj
-
-        strike_price_diffs = np.abs(strikes[:, np.newaxis] - es_closes_adj)
-
-        gamma_shares = gamma_day_df["gamma_shares"].to_numpy()
-
-        nearby_gamma_shares = np.sum(np.where(strike_price_diffs <= 5.0, gamma_shares[:, np.newaxis], 0.0), axis=0)
-
-        relative_gamma_shares = np.sum(np.where(strike_price_diffs <= 15.0, gamma_shares[:, np.newaxis], 0.0), axis=0)
-
-        nearby_gamma_score = nearby_gamma_shares / relative_gamma_shares
-        nearby_gamma_score = np.nan_to_num(nearby_gamma_score, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        group["nearby_gamma_score"] = nearby_gamma_score
-
-        # pd.set_option('display.max_rows', None)
-        # print(group)
-        # exit()
+        group['nearby_gamma_score'] = 0.0
+        group.loc[rth_idx, 'nearby_gamma_score'] = iv_mapper.compute_gamma_stats(rth_df)
 
         return group
 
     es_data_df = es_data_df.groupby('trading_day').apply(compute_gamma_stats, include_groups=False).reset_index()
-    es_data_df.drop('level_1', axis=1, inplace=True)
 
-    es_data_df["Date"] = es_data_df["Date"].dt.strftime('%m/%d/%Y')
+    raw_df["nearby_gamma_score"] = es_data_df["nearby_gamma_score"]
+    raw_df.to_csv("es_min_3y_clean_td_gamma.csv", index=False)
 
-
-    es_data_df.to_csv("es_min_3y_clean_td_gamma.csv", index=False)
 
 
 
@@ -558,9 +525,11 @@ if __name__ == "__main__":
     p.add_argument("directory", help="Path to folder containing DBN (.dbn / .dbn.zst) file(s)")
 
     args = p.parse_args()
-    process_dbn_chunked(args)
+    # process_dbn_chunked(args)
 
     # dbn_to_parquet(args.directory)
+
+    merge_gamma_stats_with_es_data()
 
     # merge_gamma_shares_parquets()
     # inspect_parquet("gamma_shares_combined.parquet")
