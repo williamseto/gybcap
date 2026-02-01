@@ -750,7 +750,7 @@ def main():
     # bars = df.resample(tf).agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
 
     # df2 = load_data('../es_min_20220911_20250905_td.csv')
-    df2 = load_data('../raw_data/es_min_3y_clean_td.csv')
+    df2 = load_data('../raw_data/es_min_3y_clean_td_gamma.csv')
 
     agg_dict = {
         'open':'first',
@@ -759,20 +759,20 @@ def main():
         'close':'last',
         'volume':'sum'
     }
-    bars = df2.set_index('dt').groupby('trading_day').resample('5min').agg(agg_dict).dropna().reset_index()
+    bars = df2.set_index('dt').groupby('trading_day').resample('15min').agg(agg_dict).dropna().reset_index()
 
     # attach prev-day levels
     plp = PriceLevelProvider(df2)
     bars = plp.attach_levels_to_bars(bars)
 
 
-    # strat = BreakoutRetestStrategy(bars, level_cols=['prev_high','prev_low','vwap', 'ovn_lo', 'ovn_hi', 'ib_lo', 'ib_hi', 'rth_lo', 'rth_hi'],
-    #                                threshold_pct=0.0012, lookahead_bars=10)
-    # trades, trade_features_df = strat.find_retest_and_build_trades(stop_buffer_pct=0.0025, rr=2.0, fixed_size=1.0)
-
-    strat = ReversionStrategy(bars, level_cols=['prev_high','prev_low','vwap', 'ovn_lo', 'ovn_hi', 'ib_lo', 'ib_hi','rth_lo', 'rth_hi'],
+    strat = BreakoutRetestStrategy(bars, level_cols=['prev_high','prev_low','vwap', 'ovn_lo', 'ovn_hi', 'ib_lo', 'ib_hi', 'rth_lo', 'rth_hi'],
                                    threshold_pct=0.0012, lookahead_bars=10)
     trades, trade_features_df = strat.find_retest_and_build_trades(stop_buffer_pct=0.0025, rr=2.0, fixed_size=1.0)
+
+    # strat = ReversionStrategy(bars, level_cols=['prev_high','prev_low','vwap', 'ovn_lo', 'ovn_hi', 'ib_lo', 'ib_hi','rth_lo', 'rth_hi'],
+    #                                threshold_pct=0.0012, lookahead_bars=10)
+    # trades, trade_features_df = strat.find_retest_and_build_trades(stop_buffer_pct=0.0025, rr=2.0, fixed_size=1.0)
 
 
     total_pnl = 0
@@ -798,7 +798,7 @@ def main():
 
     print(f"Train PNL: {train_pnl} trades: {train_trades}")
 
-    # model.save_model('reversion_model.json')
+    model.save_model('bo_retest_model.json')
     
 
     exit()

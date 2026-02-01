@@ -87,8 +87,24 @@ class DaltonDayType(Enum):
         return mapping[day_type]
 
     @classmethod
-    def all_labels(cls, simple: bool = False) -> List[str]:
+    def to_binary(cls, day_type: 'DaltonDayType') -> str:
+        """Map 7-class to 2-class labels (Balance vs Trend)."""
+        mapping = {
+            cls.TREND_UP: "Trend",
+            cls.TREND_DOWN: "Trend",
+            cls.NORMAL: "Balance",
+            cls.NORMAL_VARIATION: "Balance",
+            cls.DOUBLE_DISTRIBUTION: "Balance",
+            cls.P_SHAPE: "Balance",
+            cls.B_SHAPE: "Balance",
+        }
+        return mapping[day_type]
+
+    @classmethod
+    def all_labels(cls, simple: bool = False, binary: bool = False) -> List[str]:
         """Return all label names."""
+        if binary:
+            return ["Balance", "Trend"]
         if simple:
             return ["Trend", "Balance", "Double"]
         return [dt.value for dt in cls]
@@ -553,8 +569,12 @@ else:
 class DayLabeler:
     """Label days using heuristic rules or GMM clustering."""
 
-    def __init__(self, simple_labels: bool = False):
+    def __init__(self, simple_labels: bool = False, binary_labels: bool = False,
+                 early_trend_mode: bool = False, early_minutes: int = 90):
         self.simple_labels = simple_labels
+        self.binary_labels = binary_labels
+        self.early_trend_mode = early_trend_mode
+        self.early_minutes = early_minutes
         self.vp_builder = VolumeProfileBuilder()
 
     def heuristic_label(
@@ -562,13 +582,15 @@ class DayLabeler:
         prices: np.ndarray,
         volumes: np.ndarray,
         open_price: Optional[float] = None,
-        close_price: Optional[float] = None
+        close_price: Optional[float] = None,
+        highs: Optional[np.ndarray] = None,
+        lows: Optional[np.ndarray] = None
     ) -> str:
         """
         Apply Dalton-style heuristic rules to label a day.
 
         Returns:
-            Label string (7-class or 3-class depending on simple_labels)
+            Label string (7-class, 3-class, or 2-class depending on mode)
         """
         # Build VBP and compute metrics
         bin_centers, per_minute_vbp = self.vp_builder.build_minute_vbp_matrix(prices, volumes)
@@ -591,6 +613,17 @@ class DayLabeler:
             close_price = prices[-1]
         close_vs_open = (close_price - open_price) / max(1.0, abs(open_price)) * 100
 
+        # For early trend mode, label based on first N minutes only
+        if self.early_trend_mode:
+            return self._early_trend_label(prices, volumes, highs, lows)
+
+        # For binary mode, use more aggressive trend detection
+        if self.binary_labels:
+            return self._binary_trend_label(
+                prices, volumes, highs, lows, poc_rel, va_width_rel,
+                close_vs_open, day_range, open_price, close_price
+            )
+
         # Classification logic (7-class)
         day_type = self._apply_heuristic_rules(
             poc_rel, va_width_rel, n_peaks, peak_separation, close_vs_open
@@ -599,6 +632,206 @@ class DayLabeler:
         if self.simple_labels:
             return DaltonDayType.to_simple(day_type)
         return day_type.value
+
+    def _early_trend_label(
+        self,
+        prices: np.ndarray,
+        volumes: np.ndarray,
+        highs: Optional[np.ndarray],
+        lows: Optional[np.ndarray]
+    ) -> str:
+        """
+        Label based on early (first N minutes) trend characteristics.
+
+        This creates labels that are more predictable from early features,
+        since we're predicting whether the early period shows trend behavior,
+        not what the final day type will be.
+
+        A day is labeled as "Trend" if the first N minutes show:
+        - Strong directional movement (OTF)
+        - Price staying consistently away from opening range
+        - Narrow value area developing
+        """
+        T = len(prices)
+        early_end = min(self.early_minutes, T)
+
+        # Use only first N minutes for labeling
+        early_prices = prices[:early_end]
+        early_volumes = volumes[:early_end]
+        early_highs = highs[:early_end] if highs is not None else early_prices
+        early_lows = lows[:early_end] if lows is not None else early_prices
+
+        # Compute early characteristics
+        early_range = max(0.25, early_highs.max() - early_lows.min())
+        open_price = early_prices[0]
+
+        # One-time-framing in early period
+        running_high = np.maximum.accumulate(early_highs)
+        running_low = np.minimum.accumulate(early_lows)
+        new_highs = np.sum(running_high[1:] > running_high[:-1])
+        new_lows = np.sum(running_low[1:] < running_low[:-1])
+        total_ext = new_highs + new_lows
+        otf_ratio = abs(new_highs - new_lows) / max(1, total_ext)
+        otf_direction = (new_highs - new_lows) / max(1, total_ext)
+
+        # Build early VBP
+        bc, vbp_matrix = self.vp_builder.build_minute_vbp_matrix(early_prices, early_volumes)
+        early_vbp = vbp_matrix.sum(axis=0)
+        poc_price = self.vp_builder.compute_poc(early_vbp, bc)
+        va_low, va_high = self.vp_builder.compute_va70(early_vbp, bc)
+        va_width_rel = (va_high - va_low) / early_range
+
+        # POC position
+        poc_rel = (poc_price - early_lows.min()) / early_range
+
+        # Price movement from open
+        close_early = early_prices[-1]
+        move_from_open = (close_early - open_price) / early_range
+
+        # Opening range (first 15 minutes) breakout
+        or15_high = early_highs[:min(15, early_end)].max()
+        or15_low = early_lows[:min(15, early_end)].min()
+        or15_breakout = 0.0
+        if close_early > or15_high:
+            or15_breakout = (close_early - or15_high) / (or15_high - or15_low + 0.01)
+        elif close_early < or15_low:
+            or15_breakout = (close_early - or15_low) / (or15_high - or15_low + 0.01)
+
+        # Early trend scoring
+        trend_score = 0.0
+
+        # Strong one-time-framing (directional conviction)
+        if otf_ratio > 0.65:
+            trend_score += 2.5
+        elif otf_ratio > 0.50:
+            trend_score += 1.5
+
+        # Narrow early VA (price found value quickly)
+        if va_width_rel < 0.40:
+            trend_score += 2.0
+        elif va_width_rel < 0.55:
+            trend_score += 1.0
+
+        # POC at extreme
+        if poc_rel > 0.70 or poc_rel < 0.30:
+            trend_score += 1.5
+        elif poc_rel > 0.60 or poc_rel < 0.40:
+            trend_score += 0.75
+
+        # Strong OR breakout
+        if abs(or15_breakout) > 1.0:
+            trend_score += 2.0
+        elif abs(or15_breakout) > 0.5:
+            trend_score += 1.0
+
+        # Significant move from open
+        if abs(move_from_open) > 0.6:
+            trend_score += 1.5
+        elif abs(move_from_open) > 0.4:
+            trend_score += 0.75
+
+        # Threshold: 5.0+ for early trend
+        if trend_score >= 5.0:
+            return "Trend"
+        return "Balance"
+
+    def _binary_trend_label(
+        self,
+        prices: np.ndarray,
+        volumes: np.ndarray,
+        highs: Optional[np.ndarray],
+        lows: Optional[np.ndarray],
+        poc_rel: float,
+        va_width_rel: float,
+        close_vs_open: float,
+        day_range: float,
+        open_price: float,
+        close_price: float
+    ) -> str:
+        """
+        More aggressive trend detection for binary classification.
+
+        A trend day is characterized by:
+        - One-time framing (most bars make new highs OR new lows)
+        - Price moving away from open and staying away
+        - POC at extreme of range
+        - Close near extreme
+        """
+        T = len(prices)
+
+        # Compute one-time-framing score (OTF)
+        # Count bars that make new highs vs new lows
+        if highs is not None and lows is not None:
+            running_high = np.maximum.accumulate(highs)
+            running_low = np.minimum.accumulate(lows)
+        else:
+            running_high = np.maximum.accumulate(prices)
+            running_low = np.minimum.accumulate(prices)
+
+        new_highs = np.sum(running_high[1:] > running_high[:-1])
+        new_lows = np.sum(running_low[1:] < running_low[:-1])
+
+        # One-time-frame ratio: how directional was the day?
+        total_extensions = new_highs + new_lows
+        if total_extensions > 0:
+            otf_ratio = abs(new_highs - new_lows) / total_extensions
+        else:
+            otf_ratio = 0.0
+
+        # Close position relative to range
+        close_rel = (close_price - prices.min()) / day_range if day_range > 0 else 0.5
+
+        # Directional conviction: how far did price move from open?
+        move_from_open = abs(close_price - open_price) / day_range if day_range > 0 else 0.0
+
+        # Volume-weighted price position: is volume concentrated at one end?
+        weighted_price = np.average(prices, weights=volumes)
+        weighted_price_rel = (weighted_price - prices.min()) / day_range if day_range > 0 else 0.5
+
+        # Trend scoring - multiple signals must align
+        trend_score = 0.0
+
+        # 1. Narrow value area (strong trend signal)
+        if va_width_rel < 0.45:
+            trend_score += 2.0
+        elif va_width_rel < 0.55:
+            trend_score += 1.0
+
+        # 2. POC at extreme (price finding value at edge)
+        if poc_rel > 0.70 or poc_rel < 0.30:
+            trend_score += 2.0
+        elif poc_rel > 0.60 or poc_rel < 0.40:
+            trend_score += 1.0
+
+        # 3. Close at extreme (trend didn't reverse)
+        if close_rel > 0.75 or close_rel < 0.25:
+            trend_score += 1.5
+        elif close_rel > 0.65 or close_rel < 0.35:
+            trend_score += 0.5
+
+        # 4. Strong one-time-framing
+        if otf_ratio > 0.70:
+            trend_score += 2.0
+        elif otf_ratio > 0.50:
+            trend_score += 1.0
+
+        # 5. Significant move from open
+        if move_from_open > 0.70:
+            trend_score += 1.5
+        elif move_from_open > 0.50:
+            trend_score += 0.75
+
+        # 6. Close vs open consistency with POC
+        # Up trend: positive close_vs_open AND high POC
+        # Down trend: negative close_vs_open AND low POC
+        if (close_vs_open > 0.3 and poc_rel > 0.60) or (close_vs_open < -0.3 and poc_rel < 0.40):
+            trend_score += 1.5
+
+        # Threshold for trend classification
+        # Score >= 5.0 indicates strong trend characteristics
+        if trend_score >= 5.0:
+            return "Trend"
+        return "Balance"
 
     def _apply_heuristic_rules(
         self,
@@ -1053,6 +1286,125 @@ class FeatureExtractor:
                 if prev_range > 0:
                     range_expansion_rate = (current_range - prev_range) / prev_range
 
+            # === EARLY TREND DETECTION FEATURES ===
+
+            # One-time-framing (OTF) score: directional conviction
+            # Count new highs vs new lows up to this point
+            otf_score = 0.0
+            otf_direction = 0.0
+            if t >= 5:
+                new_highs_t = np.sum(running_high[1:t+1] > running_high[:t])
+                new_lows_t = np.sum(running_low[1:t+1] < running_low[:t])
+                total_ext = new_highs_t + new_lows_t
+                if total_ext > 0:
+                    otf_score = abs(new_highs_t - new_lows_t) / total_ext
+                    otf_direction = (new_highs_t - new_lows_t) / total_ext
+
+            # Price position in current range (early trend signal)
+            price_in_range = (prices[t] - running_low[t]) / current_range if current_range > 0 else 0.5
+
+            # Distance from open (trend strength)
+            dist_from_open = (prices[t] - open_price) / current_range if current_range > 0 else 0.0
+
+            # Momentum: rate of price change (velocity)
+            momentum_5 = 0.0
+            momentum_10 = 0.0
+            if t >= 5:
+                momentum_5 = (prices[t] - prices[t-5]) / current_range if current_range > 0 else 0.0
+            if t >= 10:
+                momentum_10 = (prices[t] - prices[t-10]) / current_range if current_range > 0 else 0.0
+
+            # Acceleration: change in momentum
+            acceleration = 0.0
+            if t >= 10:
+                mom_now = prices[t] - prices[t-5]
+                mom_prev = prices[t-5] - prices[t-10]
+                acceleration = (mom_now - mom_prev) / current_range if current_range > 0 else 0.0
+
+            # Breakout strength from opening ranges
+            or5_breakout = 0.0
+            or15_breakout = 0.0
+            or30_breakout = 0.0
+            if t >= 5 and or5_high is not None:
+                or5_range = or5_high - or5_low
+                if or5_range > 0:
+                    if prices[t] > or5_high:
+                        or5_breakout = (prices[t] - or5_high) / or5_range
+                    elif prices[t] < or5_low:
+                        or5_breakout = (prices[t] - or5_low) / or5_range
+            if t >= 15 and or15_high is not None:
+                or15_range = or15_high - or15_low
+                if or15_range > 0:
+                    if prices[t] > or15_high:
+                        or15_breakout = (prices[t] - or15_high) / or15_range
+                    elif prices[t] < or15_low:
+                        or15_breakout = (prices[t] - or15_low) / or15_range
+            if t >= 30 and or30_high is not None:
+                or30_range = or30_high - or30_low
+                if or30_range > 0:
+                    if prices[t] > or30_high:
+                        or30_breakout = (prices[t] - or30_high) / or30_range
+                    elif prices[t] < or30_low:
+                        or30_breakout = (prices[t] - or30_low) / or30_range
+
+            # Volume surge: current volume vs average so far
+            avg_vol_so_far = cum_vol[t] / (t + 1) if t >= 0 else 1.0
+            recent_vol = volumes[t] if t < len(volumes) else avg_vol_so_far
+            vol_surge = recent_vol / max(1.0, avg_vol_so_far)
+
+            # Price vs VWAP deviation (strong trend = price stays away from VWAP)
+            vwap_deviation = abs(prices[t] - vwap[t]) / current_range if current_range > 0 else 0.0
+
+            # Close relative to range (0 = at low, 1 = at high)
+            close_position = price_in_range
+
+            # === EARLY TREND SCORE ===
+            # Compute a continuous 0-1 score of how "trend-like" the day looks
+            # This can be used as a feature for EOD prediction
+            early_trend_score = 0.0
+
+            # Component 1: OTF score (0-2.5 points)
+            if otf_score > 0.65:
+                early_trend_score += 2.5
+            elif otf_score > 0.50:
+                early_trend_score += 1.5
+            elif otf_score > 0.35:
+                early_trend_score += 0.5
+
+            # Component 2: VA width (0-2 points) - narrow = trend
+            if va_width_rel < 0.40:
+                early_trend_score += 2.0
+            elif va_width_rel < 0.55:
+                early_trend_score += 1.0
+            elif va_width_rel < 0.70:
+                early_trend_score += 0.5
+
+            # Component 3: POC position (0-1.5 points) - at extreme = trend
+            if poc_rel > 0.70 or poc_rel < 0.30:
+                early_trend_score += 1.5
+            elif poc_rel > 0.60 or poc_rel < 0.40:
+                early_trend_score += 0.75
+
+            # Component 4: OR breakout (0-2 points)
+            max_breakout = max(abs(or5_breakout), abs(or15_breakout), abs(or30_breakout))
+            if max_breakout > 1.0:
+                early_trend_score += 2.0
+            elif max_breakout > 0.5:
+                early_trend_score += 1.0
+            elif max_breakout > 0.25:
+                early_trend_score += 0.5
+
+            # Component 5: Distance from open (0-1.5 points)
+            if abs(dist_from_open) > 0.6:
+                early_trend_score += 1.5
+            elif abs(dist_from_open) > 0.4:
+                early_trend_score += 0.75
+            elif abs(dist_from_open) > 0.2:
+                early_trend_score += 0.25
+
+            # Normalize to 0-1 range (max possible = 9.5)
+            early_trend_score = min(1.0, early_trend_score / 9.5)
+
             row = {
                 'minute': t,
                 'minute_norm': t / max(1, T - 1),
@@ -1074,6 +1426,21 @@ class FeatureExtractor:
                 'cum_vol': float(cum_vol[t]),
                 'vol_share': float(cum_vol[t]) / max(1.0, total_day_vol),
                 'cum_delta_rate': cum_delta_rate,
+                # Early trend detection features
+                'otf_score': otf_score,
+                'otf_direction': otf_direction,
+                'price_in_range': price_in_range,
+                'dist_from_open': dist_from_open,
+                'momentum_5': momentum_5,
+                'momentum_10': momentum_10,
+                'acceleration': acceleration,
+                'or5_breakout': or5_breakout,
+                'or15_breakout': or15_breakout,
+                'or30_breakout': or30_breakout,
+                'vol_surge': vol_surge,
+                'vwap_deviation': vwap_deviation,
+                'range_expansion_rate': range_expansion_rate,
+                'early_trend_score': early_trend_score,
                 # Prior day / overnight context (constant for all minutes)
                 'gap_pct': gap_pct,
                 'open_vs_prior_poc': open_vs_prior_poc,
@@ -1108,7 +1475,40 @@ class DaltonClassifier:
         'minute_norm', 'price_vs_vwap', 'running_poc_rel', 'running_va_width_rel',
         'cum_entropy', 'cum_peak_count', 'cum_peak_separation', 'ret_1m', 'ret_5m',
         'ib_high_dist', 'ib_low_dist', 'range_ext_up', 'range_ext_down',
-        'vol_rate', 'vol_share', 'cum_delta_rate'
+        'vol_rate', 'vol_share', 'cum_delta_rate',
+        # Early trend detection features
+        'otf_score', 'otf_direction', 'price_in_range', 'dist_from_open',
+        'momentum_5', 'momentum_10', 'acceleration',
+        'or5_breakout', 'or15_breakout', 'or30_breakout',
+        'early_trend_score',  # Composite early trend indicator
+        'vol_surge', 'vwap_deviation', 'range_expansion_rate'
+    ]
+
+    # Optimized features for binary (Balance vs Trend) classification
+    # Focus on robust early signals that generalize well
+    BINARY_FEATURE_COLS = [
+        'minute_norm',
+        # Composite early trend indicator (most important)
+        'early_trend_score',
+        # Core early trend signals
+        'otf_score',           # Directional conviction
+        'otf_direction',       # Direction of conviction
+        'dist_from_open',      # How far from open
+        'price_in_range',      # Where is price in current range
+        # Opening range breakouts (key early trend signals)
+        'or5_breakout',        # Early breakout
+        'or15_breakout',       # Medium-term breakout
+        # Volume profile shape (fundamental to Dalton)
+        'running_poc_rel',     # POC position
+        'running_va_width_rel', # Value area width
+        # Price vs VWAP (institutional reference)
+        'price_vs_vwap',
+        'vwap_deviation',
+        # Order flow
+        'cum_delta_rate',
+        # IB extensions (after 60 mins)
+        'range_ext_up',
+        'range_ext_down',
     ]
 
     def __init__(
@@ -1116,13 +1516,21 @@ class DaltonClassifier:
         n_classes: int = 7,
         feature_cols: Optional[List[str]] = None,
         xgb_params: Optional[Dict[str, Any]] = None,
-        profile_encoder: Optional[ProfileEncoder] = None
+        profile_encoder: Optional[ProfileEncoder] = None,
+        binary_mode: bool = False
     ):
         self.n_classes = n_classes
         self.profile_encoder = profile_encoder
+        self.binary_mode = binary_mode
 
-        # Build feature list including profile features
-        base_features = feature_cols or self.DEFAULT_FEATURE_COLS.copy()
+        # Build feature list - use binary features for 2-class mode
+        if feature_cols is not None:
+            base_features = feature_cols
+        elif binary_mode:
+            base_features = self.BINARY_FEATURE_COLS.copy()
+        else:
+            base_features = self.DEFAULT_FEATURE_COLS.copy()
+
         if profile_encoder is not None:
             profile_feature_names = profile_encoder.get_feature_names()
             base_features = base_features + profile_feature_names
@@ -1133,21 +1541,41 @@ class DaltonClassifier:
         self.label_encoder: Dict[str, int] = {}
         self.label_decoder: Dict[int, str] = {}
 
-        self.xgb_params = xgb_params or {
-            'objective': 'multi:softprob',
-            'num_class': n_classes,
-            'max_depth': 6,
-            'learning_rate': 0.05,
-            'n_estimators': 500,
-            'min_child_weight': 5,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'reg_alpha': 0.1,
-            'reg_lambda': 1.0,
-            'random_state': 42,
-            'n_jobs': -1,
-            'verbosity': 0
-        }
+        # Use binary classification params for 2-class mode
+        # Shallow trees with high regularization for better early-minute generalization
+        if binary_mode:
+            self.xgb_params = xgb_params or {
+                'objective': 'binary:logistic',
+                'max_depth': 3,  # Shallow trees generalize better
+                'learning_rate': 0.02,
+                'n_estimators': 1000,
+                'min_child_weight': 20,  # More samples needed per leaf
+                'subsample': 0.7,
+                'colsample_bytree': 0.6,
+                'reg_alpha': 1.0,  # Higher L1 regularization
+                'reg_lambda': 5.0,  # Higher L2 regularization
+                'gamma': 1.0,  # Min loss reduction for split
+                'scale_pos_weight': 1.0,  # Will be set based on class imbalance
+                'random_state': 42,
+                'n_jobs': -1,
+                'verbosity': 0
+            }
+        else:
+            self.xgb_params = xgb_params or {
+                'objective': 'multi:softprob',
+                'num_class': n_classes,
+                'max_depth': 6,
+                'learning_rate': 0.05,
+                'n_estimators': 500,
+                'min_child_weight': 5,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'reg_alpha': 0.1,
+                'reg_lambda': 1.0,
+                'random_state': 42,
+                'n_jobs': -1,
+                'verbosity': 0
+            }
 
     def _encode_labels(self, labels: pd.Series) -> np.ndarray:
         """Encode string labels to integers."""
@@ -1223,9 +1651,18 @@ class DaltonClassifier:
         sample_weights = self.compute_sample_weights(y_train_encoded, minute_norm, early_weight)
 
         if HAS_XGB:
-            # Update num_class based on actual classes
-            self.xgb_params['num_class'] = len(self.label_encoder)
-            self.model = xgb.XGBClassifier(**self.xgb_params)
+            # Update params based on actual classes
+            if self.binary_mode:
+                # Binary classification - remove num_class if present
+                params = {k: v for k, v in self.xgb_params.items() if k != 'num_class'}
+                # Set scale_pos_weight for class imbalance
+                n_pos = np.sum(y_train_encoded == 1)
+                n_neg = np.sum(y_train_encoded == 0)
+                params['scale_pos_weight'] = n_neg / max(1, n_pos)
+            else:
+                params = self.xgb_params.copy()
+                params['num_class'] = len(self.label_encoder)
+            self.model = xgb.XGBClassifier(**params)
 
             eval_set = None
             if X_val is not None and y_val is not None:
@@ -1789,6 +2226,9 @@ def load_and_preprocess_data(
 def build_dataset(
     df: pd.DataFrame,
     simple_labels: bool = False,
+    binary_labels: bool = False,
+    early_trend_mode: bool = False,
+    early_minutes: int = 90,
     compare_labels_flag: bool = False,
     output_dir: Optional[str] = None,
     profile_encoding: str = 'none',
@@ -1801,6 +2241,9 @@ def build_dataset(
     Args:
         df: DataFrame with minute bar data
         simple_labels: Use 3-class labels
+        binary_labels: Use 2-class labels (Balance/Trend)
+        early_trend_mode: Label based on first N minutes trend characteristics
+        early_minutes: Minutes for early trend labeling
         compare_labels_flag: Compare heuristic vs cluster labels
         output_dir: Output directory
         profile_encoding: 'none', 'histogram', or 'autoencoder'
@@ -1812,7 +2255,12 @@ def build_dataset(
         days_df: Per-day summary with labels
         profile_encoder: Trained profile encoder (or None)
     """
-    labeler = DayLabeler(simple_labels=simple_labels)
+    labeler = DayLabeler(
+        simple_labels=simple_labels,
+        binary_labels=binary_labels,
+        early_trend_mode=early_trend_mode,
+        early_minutes=early_minutes
+    )
 
     # Create profile encoder if needed
     profile_encoder = None
@@ -1852,7 +2300,7 @@ def build_dataset(
         # Get day label
         open_price = prices[0]
         close_price = prices[-1]
-        label = labeler.heuristic_label(prices, volumes, open_price, close_price)
+        label = labeler.heuristic_label(prices, volumes, open_price, close_price, highs, lows)
 
         # Compute daily stats for prior day context
         daily_stats = FeatureExtractor.compute_daily_stats(prices, volumes, highs, lows)
@@ -1968,6 +2416,7 @@ def train_pipeline(
     days_df: pd.DataFrame,
     output_dir: str,
     simple_labels: bool = False,
+    binary_labels: bool = False,
     early_weight: float = 1.0,
     seed: int = 42,
     profile_encoder: Optional[ProfileEncoder] = None
@@ -1980,6 +2429,7 @@ def train_pipeline(
         days_df: Per-day summaries
         output_dir: Output directory
         simple_labels: Use 3-class labels
+        binary_labels: Use 2-class labels (Balance/Trend)
         early_weight: Early-minute weighting factor
         seed: Random seed
         profile_encoder: Trained profile encoder (optional)
@@ -1990,7 +2440,7 @@ def train_pipeline(
     os.makedirs(output_dir, exist_ok=True)
 
     # Get label info
-    labels = DaltonDayType.all_labels(simple=simple_labels)
+    labels = DaltonDayType.all_labels(simple=simple_labels, binary=binary_labels)
     n_classes = len(set(samples_df['label'].unique()))
 
     print(f"Training with {n_classes} classes: {sorted(samples_df['label'].unique())}")
@@ -2027,7 +2477,11 @@ def train_pipeline(
     print(f"Days: train={train_df['trading_day'].nunique()}, val={val_df['trading_day'].nunique()}, test={test_df['trading_day'].nunique()}")
 
     # Train classifier
-    classifier = DaltonClassifier(n_classes=n_classes, profile_encoder=profile_encoder)
+    classifier = DaltonClassifier(
+        n_classes=n_classes,
+        profile_encoder=profile_encoder,
+        binary_mode=binary_labels
+    )
 
     X_train = train_df.drop(columns=['label', 'trading_day'], errors='ignore')
     y_train = train_df['label']
@@ -2092,6 +2546,284 @@ def train_pipeline(
         'test_df': test_df,
         'eod_acc': eod_acc,
         'thresholds': thresholds
+    }
+
+
+def train_joint_pipeline(
+    df: pd.DataFrame,
+    output_dir: str,
+    early_minutes: int = 60,
+    early_weight: float = 3.0,
+    seed: int = 42
+) -> Dict[str, Any]:
+    """
+    Joint training pipeline that optimizes early-trend and EOD models together.
+
+    Approach:
+    1. Build datasets with both early-trend and EOD labels
+    2. Train early-trend model first
+    3. Generate early-trend predictions for all samples
+    4. Add early-trend predictions as features for EOD model
+    5. Train EOD model with enhanced features
+    6. Evaluate both models
+
+    Args:
+        df: Raw minute bar data
+        output_dir: Output directory
+        early_minutes: Minutes for early-trend labeling
+        early_weight: Weight for early minutes
+        seed: Random seed
+
+    Returns:
+        Dictionary with both models and evaluation results
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("=" * 60)
+    print("JOINT TRAINING PIPELINE")
+    print("=" * 60)
+
+    # Create labelers for both tasks
+    early_labeler = DayLabeler(early_trend_mode=True, early_minutes=early_minutes)
+    eod_labeler = DayLabeler(binary_labels=True)
+
+    feature_extractor = FeatureExtractor()
+
+    # Group by trading day
+    grouped = df.groupby('trading_day')
+
+    # Build dataset with both labels
+    print("\n[Step 1] Building dataset with dual labels...")
+    day_data_cache = []
+
+    for day_id, day_df in grouped:
+        day_df = day_df.sort_values(by=['Time'] if 'Time' in day_df.columns else day_df.columns[0])
+
+        prices = day_df['Close'].values.astype(float)
+        volumes = day_df['Volume'].values.astype(float)
+        highs = day_df['High'].values if 'High' in day_df.columns else None
+        lows = day_df['Low'].values if 'Low' in day_df.columns else None
+        bid_vols = day_df['BidVolume'].values if 'BidVolume' in day_df.columns else None
+        ask_vols = day_df['AskVolume'].values if 'AskVolume' in day_df.columns else None
+
+        if len(prices) < early_minutes:
+            continue
+
+        # Get both labels
+        early_label = early_labeler.heuristic_label(prices, volumes, highs=highs, lows=lows)
+        eod_label = eod_labeler.heuristic_label(prices, volumes, highs=highs, lows=lows)
+
+        day_data_cache.append({
+            'day_id': day_id,
+            'prices': prices,
+            'volumes': volumes,
+            'highs': highs,
+            'lows': lows,
+            'bid_vols': bid_vols,
+            'ask_vols': ask_vols,
+            'early_label': early_label,
+            'eod_label': eod_label,
+        })
+
+    print(f"  Processed {len(day_data_cache)} days")
+
+    # Extract per-minute features
+    print("\n[Step 2] Extracting per-minute features...")
+    samples_list = []
+
+    for day_data in day_data_cache:
+        feat_df = feature_extractor.extract_per_minute_features(
+            day_data['prices'], day_data['volumes'],
+            highs=day_data['highs'], lows=day_data['lows'],
+            bid_volumes=day_data['bid_vols'], ask_volumes=day_data['ask_vols']
+        )
+        feat_df['trading_day'] = day_data['day_id']
+        feat_df['early_label'] = day_data['early_label']
+        feat_df['eod_label'] = day_data['eod_label']
+        samples_list.append(feat_df)
+
+    samples_df = pd.concat(samples_list, ignore_index=True)
+    print(f"  Total samples: {len(samples_df)}")
+
+    # Label distributions
+    early_dist = samples_df.groupby('trading_day')['early_label'].first().value_counts(normalize=True)
+    eod_dist = samples_df.groupby('trading_day')['eod_label'].first().value_counts(normalize=True)
+    print(f"\n  Early-trend label distribution: {dict(early_dist.round(3))}")
+    print(f"  EOD label distribution: {dict(eod_dist.round(3))}")
+
+    # Split by day
+    groups = samples_df['trading_day']
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+    train_val_idx, test_idx = next(gss.split(samples_df, groups=groups))
+
+    train_val_df = samples_df.iloc[train_val_idx]
+    test_df = samples_df.iloc[test_idx].reset_index(drop=True)
+
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed + 1)
+    train_idx, val_idx = next(gss2.split(train_val_df, groups=train_val_df['trading_day']))
+
+    train_df = train_val_df.iloc[train_idx].reset_index(drop=True)
+    val_df = train_val_df.iloc[val_idx].reset_index(drop=True)
+
+    print(f"\n  Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
+
+    # =========================================================================
+    # STAGE 1: Train Early-Trend Model
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("[Stage 1] Training Early-Trend Model")
+    print("=" * 60)
+
+    early_classifier = DaltonClassifier(n_classes=2, binary_mode=True)
+
+    X_train_early = train_df.drop(columns=['early_label', 'eod_label', 'trading_day'], errors='ignore')
+    y_train_early = train_df['early_label']
+    X_val_early = val_df.drop(columns=['early_label', 'eod_label', 'trading_day'], errors='ignore')
+    y_val_early = val_df['early_label']
+
+    early_classifier.fit(X_train_early, y_train_early, X_val_early, y_val_early, early_weight=early_weight)
+
+    # Evaluate early model
+    X_test = test_df.drop(columns=['early_label', 'eod_label', 'trading_day'], errors='ignore')
+    test_df['early_pred'] = early_classifier.predict(X_test)
+    early_proba = early_classifier.predict_proba(X_test)
+    test_df['early_trend_prob'] = early_proba[:, 1] if early_proba.shape[1] > 1 else early_proba[:, 0]
+
+    # Per-minute accuracy for early model
+    early_acc_by_min = test_df.groupby('minute').apply(
+        lambda g: accuracy_score(g['early_label'], g['early_pred'])
+    )
+    early_acc_df = early_acc_by_min.reset_index()
+    early_acc_df.columns = ['minute', 'accuracy']
+
+    early_thresholds = {}
+    for thresh in [0.60, 0.70, 0.75, 0.80]:
+        found = early_acc_df[early_acc_df['accuracy'] >= thresh]
+        early_thresholds[thresh] = int(found['minute'].min()) if len(found) > 0 else None
+
+    print("\nEarly-Trend Model Results:")
+    print(f"  EOD accuracy: {accuracy_score(test_df.groupby('trading_day')['early_label'].first(), test_df.groupby('trading_day')['early_pred'].first()):.1%}")
+    print("  Earliest minute to threshold:")
+    for thresh, minute in early_thresholds.items():
+        print(f"    {thresh:.0%}: minute {minute if minute else 'not reached'}")
+
+    # =========================================================================
+    # STAGE 2: Train EOD Model with Early-Trend Predictions as Features
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("[Stage 2] Training EOD Model with Early-Trend Features")
+    print("=" * 60)
+
+    # Generate early-trend predictions for training data
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+
+    X_train_for_early = train_df.drop(columns=['early_label', 'eod_label', 'trading_day'], errors='ignore')
+    X_val_for_early = val_df.drop(columns=['early_label', 'eod_label', 'trading_day'], errors='ignore')
+
+    train_early_proba = early_classifier.predict_proba(X_train_for_early)
+    val_early_proba = early_classifier.predict_proba(X_val_for_early)
+
+    train_df['early_model_trend_prob'] = train_early_proba[:, 1] if train_early_proba.shape[1] > 1 else train_early_proba[:, 0]
+    val_df['early_model_trend_prob'] = val_early_proba[:, 1] if val_early_proba.shape[1] > 1 else val_early_proba[:, 0]
+    test_df['early_model_trend_prob'] = test_df['early_trend_prob']
+
+    # Train EOD model with the new feature
+    eod_classifier = DaltonClassifier(n_classes=2, binary_mode=True)
+
+    # Add early_model_trend_prob to feature list
+    eod_feature_cols = eod_classifier.BINARY_FEATURE_COLS.copy()
+    eod_feature_cols.append('early_model_trend_prob')
+    eod_classifier.feature_cols = eod_feature_cols
+
+    X_train_eod = train_df.drop(columns=['early_label', 'eod_label', 'trading_day'], errors='ignore')
+    y_train_eod = train_df['eod_label']
+    X_val_eod = val_df.drop(columns=['early_label', 'eod_label', 'trading_day'], errors='ignore')
+    y_val_eod = val_df['eod_label']
+
+    eod_classifier.fit(X_train_eod, y_train_eod, X_val_eod, y_val_eod, early_weight=early_weight)
+
+    # Evaluate EOD model
+    X_test_eod = test_df.drop(columns=['early_label', 'eod_label', 'trading_day', 'early_pred', 'early_trend_prob'], errors='ignore')
+    test_df['eod_pred'] = eod_classifier.predict(X_test_eod)
+
+    # Per-minute accuracy for EOD model
+    eod_acc_by_min = test_df.groupby('minute').apply(
+        lambda g: accuracy_score(g['eod_label'], g['eod_pred'])
+    )
+    eod_acc_df = eod_acc_by_min.reset_index()
+    eod_acc_df.columns = ['minute', 'accuracy']
+
+    eod_thresholds = {}
+    for thresh in [0.60, 0.70, 0.75, 0.80]:
+        found = eod_acc_df[eod_acc_df['accuracy'] >= thresh]
+        eod_thresholds[thresh] = int(found['minute'].min()) if len(found) > 0 else None
+
+    eod_test_summary = test_df.groupby('trading_day').last().reset_index()
+    eod_acc = accuracy_score(eod_test_summary['eod_label'], eod_test_summary['eod_pred'])
+
+    print("\nEOD Model Results (with early-trend features):")
+    print(f"  EOD accuracy: {eod_acc:.1%}")
+    print("  Earliest minute to threshold:")
+    for thresh, minute in eod_thresholds.items():
+        print(f"    {thresh:.0%}: minute {minute if minute else 'not reached'}")
+
+    # =========================================================================
+    # Save Results
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("Saving Models and Results")
+    print("=" * 60)
+
+    # Save early model
+    early_model_path = os.path.join(output_dir, 'early_trend_classifier.joblib')
+    early_classifier.save(early_model_path)
+
+    # Save EOD model
+    eod_model_path = os.path.join(output_dir, 'eod_classifier.joblib')
+    eod_classifier.save(eod_model_path)
+
+    # Save accuracy curves
+    early_acc_df.to_csv(os.path.join(output_dir, 'early_acc_by_minute.csv'), index=False)
+    eod_acc_df.to_csv(os.path.join(output_dir, 'eod_acc_by_minute.csv'), index=False)
+
+    # Plot combined accuracy curves
+    plt.figure(figsize=(12, 5))
+    plt.plot(early_acc_df['minute'], early_acc_df['accuracy'], label='Early-Trend Model', linewidth=2)
+    plt.plot(eod_acc_df['minute'], eod_acc_df['accuracy'], label='EOD Model (joint)', linewidth=2)
+    plt.axhline(y=0.6, color='gray', linestyle='--', alpha=0.5)
+    plt.axhline(y=0.7, color='gray', linestyle='--', alpha=0.5)
+    plt.axhline(y=0.8, color='gray', linestyle='--', alpha=0.5)
+    plt.xlabel('Minute of Day')
+    plt.ylabel('Accuracy')
+    plt.title('Joint Model Accuracy Curves')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'joint_accuracy_curves.png'), dpi=150)
+    plt.close()
+
+    # Feature importance for EOD model
+    eod_importance = eod_classifier.get_feature_importance()
+    eod_importance.to_csv(os.path.join(output_dir, 'eod_feature_importance.csv'), index=False)
+
+    print(f"\nSaved models to: {output_dir}")
+    print(f"  - {early_model_path}")
+    print(f"  - {eod_model_path}")
+
+    # Print feature importance
+    print("\nEOD Model Feature Importance (top 10):")
+    for _, row in eod_importance.head(10).iterrows():
+        print(f"  {row['feature']}: {row['importance']:.3f}")
+
+    return {
+        'early_classifier': early_classifier,
+        'eod_classifier': eod_classifier,
+        'early_acc_df': early_acc_df,
+        'eod_acc_df': eod_acc_df,
+        'early_thresholds': early_thresholds,
+        'eod_thresholds': eod_thresholds,
+        'test_df': test_df,
     }
 
 
@@ -2215,6 +2947,22 @@ def main():
         help='Use 3-class labels (Trend/Balance/Double) instead of 7-class'
     )
     parser.add_argument(
+        '--binary-labels', action='store_true',
+        help='Use 2-class labels (Balance/Trend) for early detection focus'
+    )
+    parser.add_argument(
+        '--early-trend', action='store_true',
+        help='Label based on early (first 90 min) trend characteristics for better early prediction'
+    )
+    parser.add_argument(
+        '--early-minutes', type=int, default=90,
+        help='Minutes to use for early-trend labeling (default: 90)'
+    )
+    parser.add_argument(
+        '--joint', action='store_true',
+        help='Joint training: train early-trend model first, use its predictions for EOD model'
+    )
+    parser.add_argument(
         '--compare-labels', action='store_true',
         help='Compare heuristic vs GMM cluster labels'
     )
@@ -2268,6 +3016,18 @@ def main():
 
     print(f"Loaded {len(df)} bars")
 
+    # Joint training mode
+    if args.joint:
+        results = train_joint_pipeline(
+            df,
+            args.output_dir,
+            early_minutes=args.early_minutes,
+            early_weight=args.early_weight,
+            seed=args.seed
+        )
+        print(f"\nAll artifacts saved to: {args.output_dir}")
+        return
+
     # Validate autoencoder requirements
     if args.profile_encoding == 'autoencoder' and not HAS_TORCH:
         print("ERROR: PyTorch required for autoencoder encoding. Install with: pip install torch")
@@ -2285,6 +3045,9 @@ def main():
     samples_df, days_df, profile_encoder = build_dataset(
         df,
         simple_labels=args.simple_labels,
+        binary_labels=args.binary_labels,
+        early_trend_mode=args.early_trend,
+        early_minutes=args.early_minutes,
         compare_labels_flag=args.compare_labels,
         output_dir=args.output_dir,
         profile_encoding=args.profile_encoding,
@@ -2293,11 +3056,14 @@ def main():
     )
 
     # Train and evaluate
+    # Use binary mode for early_trend as well (it's 2-class)
+    use_binary = args.binary_labels or args.early_trend
     results = train_pipeline(
         samples_df,
         days_df,
         args.output_dir,
         simple_labels=args.simple_labels,
+        binary_labels=use_binary,
         early_weight=args.early_weight,
         seed=args.seed,
         profile_encoder=profile_encoder
