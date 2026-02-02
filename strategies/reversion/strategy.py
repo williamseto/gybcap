@@ -144,7 +144,7 @@ class ReversionStrategy(BaseStrategy):
     def find_retest_and_build_trades(
         self,
         stop_buffer_pct: float = 0.0025,
-        rr: float = 1.5,
+        rr: float = 2.0,
         fixed_size: float = 1.0
     ) -> Tuple[List[Trade], pd.DataFrame]:
         """

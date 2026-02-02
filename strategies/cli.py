@@ -47,11 +47,11 @@ def train_strategy(args):
     print(f"Loading data from {args.data}...")
     df = load_data(args.data)
 
-    # Determine timeframe
+    # Determine timeframe (both strategies default to 5min)
     if args.timeframe:
         timeframe = args.timeframe
     else:
-        timeframe = '5min' if args.strategy == 'breakout' else '15min'
+        timeframe = '5min'
 
     print(f"Resampling to {timeframe}...")
     bars = resample_bars(df, timeframe)
@@ -62,12 +62,16 @@ def train_strategy(args):
     plp._compute_impl(df)
     bars = plp.attach_levels_to_bars(bars, df)
 
-    # Set up level columns
-    level_cols = [
-        'prev_high', 'prev_low', 'vwap',
-        'ovn_lo', 'ovn_hi',
-        'rth_lo', 'rth_hi'
-    ]
+    # Set up level columns (different defaults per strategy based on edge analysis)
+    if args.strategy == 'reversion':
+        # Only levels with positive out-of-sample edge
+        level_cols = ['vwap', 'rth_lo', 'ovn_lo']
+    else:
+        level_cols = [
+            'prev_high', 'prev_low', 'vwap',
+            'ovn_lo', 'ovn_hi',
+            'rth_lo', 'rth_hi'
+        ]
 
     # Create strategy
     if args.strategy == 'breakout':
@@ -122,9 +126,29 @@ def train_strategy(args):
                 ].values
         feature_cols.extend(dalton.feature_names)
 
+    # Disable augmentation for reversion by default (direction flip doesn't make sense)
+    augment_data = not args.no_augment
+    if args.strategy == 'reversion' and not args.no_augment:
+        print("Note: Data augmentation disabled for reversion (use --no-augment=False to enable)")
+        augment_data = False
+
     print(f"Training model with features: {feature_cols}")
-    trainer = Trainer(feature_cols)
-    model = trainer.train(trade_features_df, verbose=True)
+    trainer = Trainer(
+        feature_cols,
+        augment_data=augment_data,
+        n_jobs=args.n_jobs
+    )
+
+    if args.cv:
+        print(f"Running cross-validation with {args.cv_folds} folds...")
+        model = trainer.train_with_cv(
+            trade_features_df,
+            quick=args.cv_quick,
+            n_folds=args.cv_folds,
+            verbose=True
+        )
+    else:
+        model = trainer.train(trade_features_df, verbose=True)
 
     # Evaluate on training data
     train_results = trainer.evaluate_trades(trades, trade_features_df, verbose=True)
@@ -142,11 +166,11 @@ def backtest_strategy(args):
     print(f"Loading data from {args.data}...")
     df = load_data(args.data)
 
-    # Determine timeframe
+    # Determine timeframe (both strategies default to 5min)
     if args.timeframe:
         timeframe = args.timeframe
     else:
-        timeframe = '5min' if args.strategy == 'breakout' else '15min'
+        timeframe = '5min'
 
     print(f"Resampling to {timeframe}...")
     bars = resample_bars(df, timeframe)
@@ -237,7 +261,7 @@ def main():
     )
     train_parser.add_argument(
         '--timeframe', '-t',
-        help='Bar timeframe (e.g., 5min, 15min). Defaults: 5min for breakout, 15min for reversion'
+        help='Bar timeframe (e.g., 5min, 15min). Default: 5min'
     )
     train_parser.add_argument(
         '--data', '-d',
@@ -275,6 +299,34 @@ def main():
         type=int,
         default=10,
         help='Lookahead bars for retest (default: 10)'
+    )
+    train_parser.add_argument(
+        '--cv',
+        action='store_true',
+        help='Use cross-validation for hyperparameter tuning'
+    )
+    train_parser.add_argument(
+        '--cv-folds',
+        type=int,
+        default=5,
+        help='Number of CV folds (default: 5)'
+    )
+    train_parser.add_argument(
+        '--cv-quick',
+        action='store_true',
+        default=True,
+        help='Use quick grid search instead of randomized search (default: True)'
+    )
+    train_parser.add_argument(
+        '--no-augment',
+        action='store_true',
+        help='Disable data augmentation (recommended for reversion strategy)'
+    )
+    train_parser.add_argument(
+        '--n-jobs',
+        type=int,
+        default=1,
+        help='Number of parallel jobs for CV (default: 1, -1 uses all cores but can cause OOM)'
     )
 
     # Backtest command

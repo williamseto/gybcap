@@ -21,17 +21,18 @@ class ReversionConfig:
     max_risk_points: float = 10.0  # Maximum risk in price points
 
     # Timeframe
-    timeframe: str = "15min"  # Default timeframe for reversion strategy
+    timeframe: str = "5min"  # Default timeframe for reversion strategy
 
     # Trade size
     fixed_size: float = 1.0
 
     def __post_init__(self):
         if self.level_cols is None:
+            # Only use levels with positive out-of-sample edge:
+            # vwap (+0.30 avg), rth_lo (+0.30 avg), ovn_lo (+0.02 avg)
+            # Excluded: prev_high (-1.02), prev_low (-2.50), ovn_hi (-0.78), rth_hi (-0.21)
             self.level_cols = [
-                'prev_high', 'prev_low', 'vwap',
-                'ovn_lo', 'ovn_hi',
-                'rth_lo', 'rth_hi'
+                'vwap', 'rth_lo', 'ovn_lo'
             ]
 
     @classmethod
