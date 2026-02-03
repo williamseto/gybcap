@@ -7,6 +7,8 @@ import pandas as pd
 
 from strategies.core.base import Trade
 from strategies.features.price_levels import PriceLevelProvider
+from strategies.features.volume_microstructure import VolumeMicrostructureProvider
+from strategies.features.reversion_quality import ReversionQualityProvider
 from strategies.training.trainer import Trainer
 from strategies.training.evaluation import calculate_trading_metrics
 
@@ -126,6 +128,31 @@ def train_strategy(args):
                 ].values
         feature_cols.extend(dalton.feature_names)
 
+    # Add volume microstructure features if requested
+    if args.volume_features:
+        print("Adding volume microstructure features...")
+        has_bidask = 'bidvolume' in df.columns and 'askvolume' in df.columns
+        vmp = VolumeMicrostructureProvider(include_bidask=has_bidask)
+        vol_features = vmp._compute_impl(df)
+        for col in vmp.feature_names:
+            if col in vol_features.columns:
+                trade_features_df[col] = vol_features.loc[
+                    trade_features_df.index, col
+                ].values
+        feature_cols.extend(vmp.feature_names)
+
+    # Add reversion quality features if requested
+    if args.quality_features:
+        print("Adding reversion quality features...")
+        rqp = ReversionQualityProvider(level_cols=level_cols)
+        qual_features = rqp._compute_impl(df)
+        for col in rqp.feature_names:
+            if col in qual_features.columns:
+                trade_features_df[col] = qual_features.loc[
+                    trade_features_df.index, col
+                ].values
+        feature_cols.extend(rqp.feature_names)
+
     # Disable augmentation for reversion by default (direction flip doesn't make sense)
     augment_data = not args.no_augment
     if args.strategy == 'reversion' and not args.no_augment:
@@ -139,7 +166,17 @@ def train_strategy(args):
         n_jobs=args.n_jobs
     )
 
-    if args.cv:
+    if args.walk_forward:
+        print(f"Running walk-forward validation with {args.cv_folds} folds...")
+        model = trainer.train_with_walk_forward(
+            trade_features_df,
+            day_col='trading_day',
+            n_folds=args.cv_folds,
+            min_train_days=args.min_train_days,
+            analyze_correlations=True,
+            verbose=True
+        )
+    elif args.cv:
         print(f"Running cross-validation with {args.cv_folds} folds...")
         model = trainer.train_with_cv(
             trade_features_df,
@@ -159,6 +196,130 @@ def train_strategy(args):
     print(f"Model saved to {output_path}")
 
     return model, trades, trade_features_df
+
+
+def train_reversal_predictor(args):
+    """Train end-to-end reversal predictor."""
+    from strategies.reversal.trainer import ReversalTrainer
+    from strategies.features.higher_timeframe import HigherTimeframeProvider
+
+    print(f"Loading data from {args.data}...")
+    df = load_data(args.data)
+
+    print(f"Loaded {len(df):,} bars across {df['trading_day'].nunique()} days")
+
+    # Initialize trainer
+    trainer = ReversalTrainer(
+        min_move_pct=args.min_move,
+        n_folds=args.n_folds,
+        min_train_days=args.min_train_days
+    )
+
+    # Compute labels
+    print("\nComputing reversal labels...")
+    labels_df = trainer.prepare_labels(df)
+
+    # Compute features
+    print("\nComputing features...")
+    features_df = trainer.prepare_features(
+        df,
+        include_htf=args.htf_features,
+        include_volume=args.volume_features,
+        include_quality=args.quality_features
+    )
+
+    # Get feature columns
+    feature_cols = []
+    if args.htf_features:
+        htf = HigherTimeframeProvider()
+        feature_cols.extend(htf.feature_names)
+    if args.volume_features:
+        from strategies.features.volume_microstructure import VolumeMicrostructureProvider
+        vmp = VolumeMicrostructureProvider()
+        feature_cols.extend(vmp.feature_names)
+    if args.quality_features:
+        from strategies.features.reversion_quality import ReversionQualityProvider
+        rqp = ReversionQualityProvider()
+        feature_cols.extend(rqp.feature_names)
+
+    # Filter to available columns
+    feature_cols = [c for c in feature_cols if c in features_df.columns]
+    print(f"\nUsing {len(feature_cols)} features")
+
+    # Analyze correlations
+    trainer.analyze_feature_correlations(features_df, labels_df, feature_cols)
+
+    # Determine which method to use (--method takes precedence over --model-type)
+    method = getattr(args, 'method', None) or args.model_type
+
+    # Train models based on method
+    if method in ['xgboost', 'all']:
+        print("\n" + "=" * 60)
+        print("TRAINING XGBOOST MODEL")
+        print("=" * 60)
+        trainer.train_xgboost_path(df, labels_df, features_df, feature_cols)
+
+    if method in ['tcn', 'all']:
+        print("\n" + "=" * 60)
+        print("TRAINING TCN MODEL")
+        print("=" * 60)
+        try:
+            trainer.train_tcn_path(df, labels_df)
+        except Exception as e:
+            print(f"TCN training failed: {e}")
+
+    if method in ['hybrid', 'all']:
+        print("\n" + "=" * 60)
+        print("TRAINING HYBRID MODEL")
+        print("=" * 60)
+        try:
+            trainer.train_hybrid_path(df, labels_df, features_df, feature_cols)
+        except Exception as e:
+            print(f"Hybrid training failed: {e}")
+
+    if method in ['anomaly', 'all']:
+        print("\n" + "=" * 60)
+        print("TRAINING ANOMALY DETECTION MODEL")
+        print("=" * 60)
+        target_recall = getattr(args, 'target_recall', 0.7)
+        use_sequences = getattr(args, 'use_sequences', False)
+        epochs = getattr(args, 'epochs', 50)
+        try:
+            # Feature-only anomaly detection
+            trainer.train_anomaly_path(
+                df, labels_df, features_df, feature_cols,
+                use_sequences=False,
+                target_recall=target_recall,
+                epochs=epochs,
+                verbose=True
+            )
+
+            # Optionally train hybrid (sequence-based) anomaly detection
+            if use_sequences or method == 'all':
+                print("\n" + "=" * 60)
+                print("TRAINING HYBRID ANOMALY DETECTION MODEL")
+                print("=" * 60)
+                trainer.train_anomaly_path(
+                    df, labels_df, features_df, feature_cols,
+                    use_sequences=True,
+                    target_recall=target_recall,
+                    epochs=epochs,
+                    verbose=True
+                )
+        except Exception as e:
+            print(f"Anomaly training failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Compare paths
+    if len(trainer.path_results) > 1:
+        trainer.compare_paths()
+
+    # Save best model
+    if args.output and trainer.path_results:
+        best_path = max(trainer.path_results.items(), key=lambda x: x[1].overall_f1)
+        print(f"\nBest model: {best_path[0]} (F1: {best_path[1].overall_f1:.2%})")
+        # Model saving would go here based on type
 
 
 def backtest_strategy(args):
@@ -328,6 +489,113 @@ def main():
         default=1,
         help='Number of parallel jobs for CV (default: 1, -1 uses all cores but can cause OOM)'
     )
+    train_parser.add_argument(
+        '--volume-features',
+        action='store_true',
+        help='Include volume microstructure features (recommended for reversion)'
+    )
+    train_parser.add_argument(
+        '--quality-features',
+        action='store_true',
+        help='Include reversion quality features (wick ratio, etc.)'
+    )
+    train_parser.add_argument(
+        '--walk-forward',
+        action='store_true',
+        help='Use walk-forward validation instead of random CV (recommended)'
+    )
+    train_parser.add_argument(
+        '--min-train-days',
+        type=int,
+        default=100,
+        help='Minimum training days for walk-forward validation (default: 100)'
+    )
+
+    # Reversal predictor command (new end-to-end approach)
+    reversal_parser = subparsers.add_parser(
+        'reversal',
+        help='Train end-to-end reversal predictor (experimental)'
+    )
+    reversal_parser.add_argument(
+        '--data', '-d',
+        default='raw_data/es_min_3y_clean_td_gamma.csv',
+        help='Input data CSV path'
+    )
+    reversal_parser.add_argument(
+        '--model-type',
+        choices=['xgboost', 'tcn', 'hybrid', 'all'],
+        default='xgboost',
+        help='Predictor model type (default: xgboost)'
+    )
+    reversal_parser.add_argument(
+        '--min-move',
+        type=float,
+        default=0.002,
+        help='Minimum move %% for reversal labeling (default: 0.2%%)'
+    )
+    reversal_parser.add_argument(
+        '--n-folds',
+        type=int,
+        default=5,
+        help='Number of walk-forward folds (default: 5)'
+    )
+    reversal_parser.add_argument(
+        '--min-train-days',
+        type=int,
+        default=100,
+        help='Minimum training days per fold (default: 100)'
+    )
+    reversal_parser.add_argument(
+        '--output', '-o',
+        help='Output model path'
+    )
+    reversal_parser.add_argument(
+        '--htf-features',
+        action='store_true',
+        default=True,
+        help='Include higher-timeframe features (default: True)'
+    )
+    reversal_parser.add_argument(
+        '--volume-features',
+        action='store_true',
+        default=True,
+        help='Include volume microstructure features (default: True)'
+    )
+    reversal_parser.add_argument(
+        '--quality-features',
+        action='store_true',
+        default=True,
+        help='Include reversion quality features (default: True)'
+    )
+    reversal_parser.add_argument(
+        '--method',
+        choices=['xgboost', 'tcn', 'hybrid', 'anomaly', 'all'],
+        default='xgboost',
+        help='Training method: xgboost, tcn, hybrid, or anomaly detection (default: xgboost)'
+    )
+    reversal_parser.add_argument(
+        '--target-recall',
+        type=float,
+        default=0.7,
+        help='Target recall for anomaly detection threshold tuning (default: 0.7)'
+    )
+    reversal_parser.add_argument(
+        '--dalton-integration',
+        choices=['none', 'weighted', 'gated'],
+        default='weighted',
+        help='Dalton day type integration for anomaly detection (default: weighted)'
+    )
+    reversal_parser.add_argument(
+        '--use-sequences',
+        action='store_true',
+        help='Use sequence-based hybrid autoencoder (default: feature-only)'
+    )
+    reversal_parser.add_argument(
+        '--epochs',
+        type=int,
+        default=50,
+        help='Training epochs for anomaly/TCN models (default: 50)'
+    )
 
     # Backtest command
     backtest_parser = subparsers.add_parser('backtest', help='Backtest a strategy')
@@ -390,6 +658,8 @@ def main():
             train_strategy(args)
     elif args.command == 'backtest':
         backtest_strategy(args)
+    elif args.command == 'reversal':
+        train_reversal_predictor(args)
     else:
         parser.print_help()
         sys.exit(1)
