@@ -15,6 +15,7 @@ from sqlalchemy import create_engine
 
 from strategy_util import *
 
+import os
 import sys
 sys.path.append("../sandbox")
 from pred_util import *
@@ -261,8 +262,10 @@ def test_func():
 
 
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 def send_discord_message(content: str):
-    DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1379637698029162577/gQ5pLAy111DYY6bM4Uce6w_FaloZo2cwK6qh89NrT1b1-JiO1QkVeIjbvumvC_JLUkgT"
+    DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
     payload = {"content": content}
     headers = {"Content-Type": "application/json"}
     resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers)
