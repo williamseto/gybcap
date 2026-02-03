@@ -1,6 +1,23 @@
 """
 breakout_retest_mplfinance.py
 
+DEPRECATED: This file has been refactored into the strategies/ package.
+Use the new modular implementation instead:
+
+    from strategies import BreakoutRetestStrategy, ReversionStrategy
+
+    # Or via CLI:
+    python -m strategies train --strategy breakout --timeframe 5min
+    python -m strategies train --strategy reversion --timeframe 15min
+
+For backward compatibility, the original code is preserved below.
+Migration guide:
+    - BreakoutRetestStrategy -> strategies.breakout.BreakoutRetestStrategy
+    - ReversionStrategy -> strategies.reversion.ReversionStrategy
+    - PriceLevelProvider -> strategies.features.PriceLevelProvider
+    - get_train_model() -> strategies.training.Trainer
+
+Original description:
 Produces an mplfinance candlestick plot of HTF bars with:
  - previous-day levels (high / low / midpoint)
  - trade entries (triangles) and exits (x)
@@ -10,6 +27,14 @@ Requires: pandas, numpy, mplfinance
 
 Run: python breakout_retest_mplfinance.py
 """
+
+import warnings
+warnings.warn(
+    "sandbox/test_bo_retest.py is deprecated. "
+    "Use the strategies package instead: python -m strategies train --strategy breakout",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 import pandas as pd
 import numpy as np

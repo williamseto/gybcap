@@ -9,6 +9,7 @@ import os
 from datetime import datetime, timedelta
 import talib
 import stats_util
+from torch.utils.tensorboard import SummaryWriter
 
 # --- 1. Environment Definition ---
 class TradingEnv:
@@ -99,7 +100,8 @@ class TradingEnv:
         sma20_rel = (sma20 - curr_price) / curr_price
 
         # Normalize PnL by current price to make it scale invariant
-        pnl_rel = self.pnl_day / curr_price
+        # pnl_rel = self.pnl_day / curr_price
+        pnl_rel = self.pnl_day
 
         curr_volume = self.curr_td_df.loc[self.t_idx]['Volume']
         curr_buy_volume = self.curr_td_df.loc[self.t_idx]['TickDataSaver:Buys']
@@ -143,7 +145,10 @@ class TradingEnv:
         # cost signals
         cost_stop = float(self.pnl_day < -self.L_max)
         cost_trade = float(exit_flag and self.position == 0)
-        done = (self.t_idx >= len(self.price_df)-1) or (self.pnl_day < -self.L_max)
+
+        # Check if the episode is done
+        done = (self.t_idx >= len(self.price_df)-1) or (self.pnl_day < -self.L_max) or (self.trade_count >= self.N_max)
+
         next_state = self._get_state()
         return next_state, reward, cost_stop, cost_trade, done
 
@@ -273,6 +278,9 @@ def train_sac(env, buffer, params, load_cpt=False):
         lambda1 = torch.tensor(checkpoint['lambda1'])
         lambda2 = torch.tensor(checkpoint['lambda2'])
 
+    # Initialize TensorBoard writer
+    writer = SummaryWriter('runs/sac_experiment')
+
     for epoch in range(params['epochs']):
         print(f'Epoch {epoch + 1}/{params["epochs"]}')
         state = env.reset()
@@ -282,6 +290,11 @@ def train_sac(env, buffer, params, load_cpt=False):
             s = torch.tensor(state, device=device).unsqueeze(0)
             dist = policy(s)
             a_idx = dist.sample().item()  # discrete action id maps to (a, exit)
+
+            # Print action probabilities
+            action_probs = dist.probs.detach().cpu().numpy()
+            print(f"Step {t + 1}, Action Probabilities: {action_probs} for state {state[-3:]}")
+            exit()
 
             # decode to (pos_adj, exit_flag)
             pos_adj, exit_flag = action_list[a_idx]
@@ -369,8 +382,12 @@ def train_sac(env, buffer, params, load_cpt=False):
                 Jc1 = c1b.mean(); Jc2 = c2b.mean()
                 lambda1 = torch.clamp(lambda1 + eta_lambda*(Jc1 - 0.0), min=0.0)
                 lambda2 = torch.clamp(lambda2 + eta_lambda*(Jc2 - T_max), min=0.0)
-                # Print losses
-                # print(f"Step {t + 1}/{params['steps_per_epoch']}, Loss Q: {loss_q.item():.4f}, Loss C1: {loss_c1.item():.4f}, Loss C2: {loss_c2.item():.4f}, Actor Loss: {actor_loss.item():.4f}")
+
+                # Log losses to TensorBoard
+                writer.add_scalar('Loss/Q', loss_q.item(), epoch * params['steps_per_epoch'] + t)
+                writer.add_scalar('Loss/C1', loss_c1.item(), epoch * params['steps_per_epoch'] + t)
+                writer.add_scalar('Loss/C2', loss_c2.item(), epoch * params['steps_per_epoch'] + t)
+                writer.add_scalar('Loss/Actor', actor_loss.item(), epoch * params['steps_per_epoch'] + t)
 
                 # Soft target updates
                 for (src, tgt) in [(qr1, qr1_t), (qr2, qr2_t), (qc1_1, qc1_1_t), (qc1_2, qc1_2_t), (qc2_1, qc2_1_t), (qc2_2, qc2_2_t)]:
@@ -383,9 +400,17 @@ def train_sac(env, buffer, params, load_cpt=False):
         avg_cost2 = np.mean([c[1] for c in epoch_costs])
         print(f"Epoch {epoch + 1} completed. Avg Reward: {avg_reward:.4f}, Avg Cost1: {avg_cost1:.4f}, Avg Cost2: {avg_cost2:.4f}")
 
+        # Log epoch statistics to TensorBoard
+        writer.add_scalar('Reward/Avg', avg_reward, epoch)
+        writer.add_scalar('Cost1/Avg', avg_cost1, epoch)
+        writer.add_scalar('Cost2/Avg', avg_cost2, epoch)
+
         if epoch % 10 == 0:
             save_checkpoint('checkpoint/sac.pt', epoch, policy, qr1, qr2, qc1_1, qc1_2, qc2_1, qc2_2, qr1_t, qr2_t, qc1_1_t, qc1_2_t, qc2_1_t, qc2_2_t,
                     opt_policy, opt_q, opt_c1, opt_c2, lambda1.item(), lambda2.item())
+
+    # Close the writer at the end of training
+    writer.close()
 
     return policy, qr1, qr2, qc1_1, qc1_2, qc2_1, qc2_2
 
@@ -446,9 +471,9 @@ dt_format_str = "%m/%d/%Y %H:%M:%S"
 price_data_df['dt'] = price_data_df.apply(lambda row: datetime.strptime(f"{row['Date']} {row['Time']}", dt_format_str), axis=1)
 
 
-env = TradingEnv(price_data_df, P_max=3, L_max=10, N_max=5)
+env = TradingEnv(price_data_df, P_max=2, L_max=20, N_max=5)
 buffer = ReplayBuffer(100000)
 params = {'state_dim':14,'action_dim':10,'batch_size':256,
           'gamma':0.99,'tau':0.005,'alpha':0.2,'lr':3e-4,
-          'eta_lambda':1e-3,'epochs':1000,'steps_per_epoch':500}
+          'eta_lambda':1e-3,'epochs':1000,'steps_per_epoch':2000}
 train_sac(env, buffer, params)

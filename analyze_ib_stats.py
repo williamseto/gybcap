@@ -26,12 +26,19 @@ hi_ext = []
 pchg = []
 other_lo_ext = []
 other_hi_ext = []
+bal_pchg = []
 up_pchg = []
 down_pchg = []
 ud_pchg = []
 up_tst = 0
 down_tst = 0
 ud_tst = 0
+ib_vol_ratio = []
+range_ratio = []
+
+ib_hi_vol = []
+ib_lo_vol = []
+
 for i in range(len(trading_day_groups)):
 
     td = i + td_offset
@@ -48,7 +55,10 @@ for i in range(len(trading_day_groups)):
     if not ib_stats:
         continue
 
-    curr_open = curr_td_df[curr_td_df['Time'] == " 09:30:00.0"]['Open']
+    # curr_open = curr_td_df[curr_td_df['Time'] == " 09:30:00.0"]['Open']
+
+    curr_open = curr_td_df[curr_td_df['Time'] == curr_td_df['Time'].values[0]]['Open']
+
     curr_close = curr_td_df[curr_td_df['Time'] == " 15:59:00.0"]['Close']
 
     if curr_open.empty or curr_close.empty:
@@ -68,26 +78,47 @@ for i in range(len(trading_day_groups)):
     ib_lo_ext = ib_stats['ib_lo'] - (ib_stats['ib_range'] * ib_ext)
 
     ib_price_df = rth_df[(rth_df['Close'] > ib_lo_ext) & (rth_df['Close'] < ib_hi_ext)]
+    # ib_price_df = rth_df[(rth_df['Close'] > ib_stats['ib_lo']) & (rth_df['Close'] < ib_stats['ib_hi'])]
 
     ib_volume = ib_price_df['Volume'].sum()
 
-    if (ib_volume / total_volume) > 0.9:
+    curr_atr = stats_df.loc[curr_td_df.index[0], 'ATR']
+
+    rth_range = ib_stats['rth_hi'] - ib_stats['rth_lo']
+
+    print(rth_df['Close'] > ib_stats['ib_hi'])
+    exit()
+    ib_hi_df = rth_df[rth_df['Close'] > ib_stats['ib_hi']]
+    ib_lo_df = rth_df[rth_df['Close'] < ib_stats['ib_lo']]
+
+    # if (ib_volume / total_volume) > 0.9:
+    if abs(curr_pchg) < 0.5:
         bal_tst = bal_tst + 1
-        lo_ext.append(ib_stats['ib_lo_ext'])
-        hi_ext.append(ib_stats['ib_hi_ext'])
+        # lo_ext.append(ib_stats['ib_lo_ext'])
+        # hi_ext.append(ib_stats['ib_hi_ext'])
+        # ib_vol_ratio.append(ib_volume / total_volume)
+        bal_pchg.append(curr_pchg)
+        range_ratio.append(ib_stats['ib_range'] / rth_range)
+
+    # else:
+    #     if ib_stats['ib_lo_ext'] < 0.25 and ib_stats['ib_hi_ext'] > 0.25:
+    #         up_tst = up_tst + 1
+    #         up_pchg.append(curr_pchg)
+
+    #     elif ib_stats['ib_hi_ext'] < 0.25 and ib_stats['ib_lo_ext'] > 0.25:
+    #         down_tst = down_tst + 1
+    #         down_pchg.append(curr_pchg)
+
+    #     elif ib_stats['ib_hi_ext'] > 0.25 and ib_stats['ib_lo_ext'] > 0.25:
+    #         ud_tst = ud_tst + 1
+    #         ud_pchg.append(curr_pchg)
+
+    elif curr_pchg > 0.5:
+        up_tst = up_tst + 1
     else:
-        if ib_stats['ib_lo_ext'] < 0.25 and ib_stats['ib_hi_ext'] > 0.25:
-            up_tst = up_tst + 1
-            up_pchg.append(curr_pchg)
-
-        elif ib_stats['ib_hi_ext'] < 0.25 and ib_stats['ib_lo_ext'] > 0.25:
-            down_tst = down_tst + 1
-            down_pchg.append(curr_pchg)
-
-        elif ib_stats['ib_hi_ext'] > 0.25 and ib_stats['ib_lo_ext'] > 0.25:
-            ud_tst = ud_tst + 1
-            ud_pchg.append(curr_pchg)
-
+        down_tst = down_tst + 1
+        ib_hi_vol.append(ib_hi_df['Volume'].sum() / total_volume)
+        ib_lo_vol.append(ib_lo_df['Volume'].sum() / total_volume)
 
     # curr_atr = stats_df.loc[curr_td_df.index[0], 'ATR']
 
@@ -120,11 +151,14 @@ print(bal_tst, up_tst, down_tst, ud_tst)
 # plt.colorbar(h[3])
 # plt.hist(pchg, bins=100)
 
-# plt.hist(up_pchg, bins=100)
+# plt.scatter(ib_hi_vol, ib_lo_vol)
+# plt.figure()
+# plt.hist(ud_pchg, bins=100)
 # plt.title('up')
 
 # plt.figure()
-plt.hist(ud_pchg, bins=100)
+# plt.hist(ud_pchg, bins=100)
 
+plt.hist(range_ratio, bins=100)
 
 plt.show()
