@@ -20,6 +20,7 @@ from strategies.core.trade_simulator import VectorizedTradeSimulator
 from strategies.features.registry import FeatureRegistry, FeaturePipeline
 from strategies.breakout.strategy import BreakoutRetestStrategy
 from strategies.reversion.strategy import ReversionStrategy
+from strategies.realtime import RealtimeEngine, EngineConfig, RealtimeStrategy
 
 __version__ = "1.0.0"
 
@@ -34,4 +35,7 @@ __all__ = [
     "FeaturePipeline",
     "BreakoutRetestStrategy",
     "ReversionStrategy",
+    "RealtimeEngine",
+    "EngineConfig",
+    "RealtimeStrategy",
 ]

@@ -36,6 +36,62 @@ Key modules:
 - `strategies/breakout/` - Breakout retest strategy
 - `strategies/reversion/` - Reversion strategy
 - `strategies/training/` - XGBoost trainer
+- `strategies/realtime/` - Modular real-time trading engine (see below)
+
+### strategies/realtime/ -- Real-Time Engine
+
+Plug-and-play real-time trading engine replacing the monolithic `util/test_client.py`.
+
+```bash
+# Run with default config (breakout + reversion, GEX, Discord)
+python -m strategies.realtime
+
+# Disable GEX provider
+python -m strategies.realtime --no-gex
+
+# Log-only mode (no Discord alerts)
+python -m strategies.realtime --no-discord
+
+# Run only specific strategies
+python -m strategies.realtime --strategies breakout
+python -m strategies.realtime --strategies reversion
+python -m strategies.realtime --strategies breakout reversion
+```
+
+Key modules:
+- `engine.py` - Slim orchestrator (data -> bars -> strategies -> signals)
+- `protocol.py` - `RealtimeStrategy` protocol + `BatchStrategyAdapter`
+- `config.py` - `EngineConfig`, `StrategySlotConfig`, `DatabaseConfig` dataclasses
+- `data_source.py` - `DataSource` protocol + `MySQLSource`
+- `bar_aggregator.py` - Tick-to-OHLC bar aggregation
+- `level_provider.py` - `DayPriceLevelProvider` (intraday VWAP, IB, OVN, etc.)
+- `signal_handler.py` - `SignalHandler` protocol + Discord/Logging handlers
+- `runner.py` - CLI entry point
+
+**Adding custom strategies:**
+```python
+from strategies.realtime import RealtimeEngine, EngineConfig, RealtimeSignal
+
+class MyStrategy:
+    @property
+    def name(self) -> str:
+        return "my_strategy"
+
+    def process(self, bars: pd.DataFrame) -> list[RealtimeSignal]:
+        # bars = 1-min OHLCV, datetime-indexed, LA timezone
+        ...
+
+config = EngineConfig.default()
+engine = RealtimeEngine(config)
+engine.register_strategy(MyStrategy())
+engine.run()
+```
+
+### graveyard/
+Archived legacy code (replaced by `strategies/realtime/`):
+- `graveyard/util/test_client.py` - Old monolithic real-time client
+- `graveyard/util/strategy_util.py` - Old duplicated strategy implementations
+- `graveyard/util/client_util.py` - Old data fetch utilities
 
 ### Data
 - Primary: `raw_data/es_min_3y_clean_td_gamma.csv` (1-min ES futures with gamma)
