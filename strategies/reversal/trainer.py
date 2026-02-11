@@ -11,6 +11,7 @@ Walk-forward validation ensures no look-ahead bias in time series.
 
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
+import gc
 import pandas as pd
 import numpy as np
 from sklearn.metrics import (
@@ -18,7 +19,20 @@ from sklearn.metrics import (
     accuracy_score, confusion_matrix
 )
 
+
+def _clear_gpu_memory():
+    """Clear GPU memory to prevent OOM during walk-forward CV."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except ImportError:
+        pass
+
 from strategies.labeling.reversal_labels import ReversalLabeler, label_strong_reversals
+from strategies.labeling.reversal_zones import TradeViableZoneLabeler
 from strategies.reversal.predictor import (
     XGBoostReversalPredictor,
     TCNReversalPredictor,
@@ -450,6 +464,11 @@ class ReversalTrainer:
                 print(f"  Accuracy: {fold_result.accuracy:.2%}")
                 print(f"  Reversal Precision: {fold_result.reversal_precision:.2%}")
 
+            # Clean up memory after each fold
+            del predictor
+            del train_df, test_df
+            _clear_gpu_memory()
+
         all_y_true = np.array(all_y_true)
         all_y_pred = np.array(all_y_pred)
 
@@ -555,6 +574,11 @@ class ReversalTrainer:
 
             if verbose:
                 print(f"  Accuracy: {fold_result.accuracy:.2%}")
+
+            # Clean up memory after each fold
+            del predictor
+            del train_df, test_df
+            _clear_gpu_memory()
 
         all_y_true = np.array(all_y_true)
         all_y_pred = np.array(all_y_pred)
@@ -826,6 +850,11 @@ class ReversalTrainer:
                 print(f"  Reversal Precision: {fold_result.reversal_precision:.2%}")
                 print(f"  Reversal Recall: {fold_result.reversal_recall:.2%}")
 
+            # Clean up memory after each fold to prevent OOM
+            del predictor
+            del train_df, test_df, train_ohlcv, test_ohlcv, train_labels
+            _clear_gpu_memory()
+
         # Overall results
         all_y_true = np.array(all_y_true)
         all_y_pred = np.array(all_y_pred)
@@ -857,6 +886,27 @@ class ReversalTrainer:
 
         if verbose:
             self._print_path_summary(result)
+
+        # Train final model on all data for threshold analysis/production use
+        if verbose:
+            print("\nTraining final model on all data for threshold analysis...")
+
+        final_predictor = AnomalyReversalPredictor(
+            feature_cols=feature_cols,
+            use_sequences=use_sequences,
+            seq_lookback=60,
+            dalton_integration='weighted' if 'dalton_trend_prob' in feature_cols else 'none'
+        )
+        final_labels = df[['reversal_label', 'reversal_magnitude']]
+        final_predictor.train(
+            ohlcv.reset_index(drop=True),
+            df.reset_index(drop=True),
+            final_labels.reset_index(drop=True),
+            epochs=epochs,
+            target_recall=target_recall,
+            verbose=False
+        )
+        self._last_anomaly_predictor = final_predictor
 
         return result
 
@@ -946,3 +996,41 @@ class ReversalTrainer:
             recalls.append(recall)
 
         return np.array(precisions), np.array(recalls), thresholds
+
+    def prepare_zone_labels(
+        self,
+        ohlcv: pd.DataFrame,
+        stop_loss_pct: float = 0.0015,
+        min_reward_risk: float = 1.5,
+        max_lookback_bars: int = 10
+    ) -> pd.DataFrame:
+        """
+        Compute trade-viable zone labels for the dataset.
+
+        Trade-viable zones label bars where entering a trade would be profitable,
+        not just the exact reversal bar. This addresses the timing problem in
+        exact-bar prediction.
+
+        Args:
+            ohlcv: OHLCV DataFrame with trading_day column
+            stop_loss_pct: Maximum allowed MAE (0.15% = 3 ES points)
+            min_reward_risk: Minimum reward:risk ratio
+            max_lookback_bars: Max bars before reversal to check
+
+        Returns:
+            DataFrame with zone labels added
+        """
+        labeler = TradeViableZoneLabeler(
+            stop_loss_pct=stop_loss_pct,
+            min_reward_risk=min_reward_risk,
+            max_lookback_bars=max_lookback_bars,
+            min_move_pct=self.min_move_pct,
+            slope_window=self.slope_window,
+            validation_bars=self.validation_bars
+        )
+
+        self.zone_labels_df = labeler.fit(ohlcv)
+        labeler.print_summary()
+
+        return self.zone_labels_df
+

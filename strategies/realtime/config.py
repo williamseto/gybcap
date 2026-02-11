@@ -43,10 +43,22 @@ class StrategySlotConfig:
 
 
 @dataclass
+class ReversalPredictorSlotConfig:
+    """Configuration for the Phase 3 reversal predictor strategy."""
+    model_dir: str = 'models/reversal_phase3'
+    pred_threshold: float = 0.50
+    proximity_pts: float = 5.0
+    historical_csv_path: Optional[str] = None
+    warmup_days: int = 60
+    enabled: bool = True
+
+
+@dataclass
 class EngineConfig:
     """Top-level engine configuration."""
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
     strategies: List[StrategySlotConfig] = field(default_factory=list)
+    reversal_predictor: Optional[ReversalPredictorSlotConfig] = None
     update_interval_sec: float = 5.0
     gex_enabled: bool = True
     discord_enabled: bool = True

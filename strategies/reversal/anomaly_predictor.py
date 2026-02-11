@@ -23,6 +23,7 @@ from strategies.reversal.autoencoder import (
     HybridReversalAutoencoder,
     create_autoencoder
 )
+from strategies.reversal.predictor import get_device
 
 
 @dataclass
@@ -95,10 +96,8 @@ class AnomalyReversalPredictor:
         self.dropout = dropout
         self.dalton_integration = dalton_integration
 
-        if device is None:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        else:
-            self.device = device
+        # Device selection with fallback
+        self.device, self.pin_memory, self.num_workers = get_device(device)
 
         self.autoencoder: Optional[nn.Module] = None
         self.scaler = StandardScaler()
@@ -204,7 +203,9 @@ class AnomalyReversalPredictor:
             dataset,
             batch_size=min(batch_size, n_reversals),
             shuffle=True,
-            drop_last=False
+            drop_last=False,
+            pin_memory=self.pin_memory,
+            num_workers=self.num_workers
         )
 
         # Training loop

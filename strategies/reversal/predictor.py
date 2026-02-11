@@ -29,6 +29,40 @@ from strategies.reversal.tcn_model import (
 )
 
 
+def get_device(requested_device: Optional[str] = None) -> Tuple[str, bool, int]:
+    """
+    Get the best available device with fallback to CPU.
+
+    Args:
+        requested_device: Explicitly requested device ('cuda', 'cpu', or None for auto)
+
+    Returns:
+        Tuple of (device_str, pin_memory, num_workers)
+    """
+    if requested_device == 'cpu':
+        return 'cpu', False, 0
+
+    if requested_device == 'cuda' or requested_device is None:
+        if torch.cuda.is_available():
+            try:
+                # Test CUDA is actually working
+                test_tensor = torch.zeros(1, device='cuda')
+                del test_tensor
+                torch.cuda.empty_cache()
+                print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+                return 'cuda', True, 4
+            except Exception as e:
+                print(f"CUDA available but failed to initialize: {e}")
+                print("Falling back to CPU")
+                return 'cpu', False, 0
+        else:
+            if requested_device == 'cuda':
+                print("CUDA requested but not available, falling back to CPU")
+            return 'cpu', False, 0
+
+    return 'cpu', False, 0
+
+
 @dataclass
 class PredictionResult:
     """Container for prediction results."""
@@ -324,10 +358,8 @@ class TCNReversalPredictor(BaseReversalPredictor):
         self.batch_size = batch_size
         self.num_epochs = num_epochs
 
-        if device is None:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        else:
-            self.device = device
+        # Device selection with fallback
+        self.device, self.pin_memory, self.num_workers = get_device(device)
 
         self.model: Optional[nn.Module] = None
         self.normalizer = NormalizationPipeline()
@@ -407,7 +439,9 @@ class TCNReversalPredictor(BaseReversalPredictor):
             dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            drop_last=True
+            drop_last=True,
+            pin_memory=self.pin_memory,
+            num_workers=self.num_workers
         )
 
         # Create model
@@ -509,7 +543,7 @@ class TCNReversalPredictor(BaseReversalPredictor):
         return self.training_results
 
     def predict(self, bars: pd.DataFrame) -> PredictionResult:
-        """Make predictions."""
+        """Make predictions with batched inference to avoid OOM."""
         if self.model is None:
             raise ValueError("Model not trained.")
 
@@ -525,17 +559,38 @@ class TCNReversalPredictor(BaseReversalPredictor):
         sequences = micro_provider.get_all_combined_sequences()
         sequences = self.normalizer.normalize_for_tcn(sequences)
 
-        # Predict
+        # Batched prediction to avoid OOM
         self.model.eval()
+        batch_size = 1024  # Smaller batch for inference
+        n_samples = len(sequences)
+
+        all_rev_prob = []
+        all_direction_probs = []
+        all_magnitude = []
+
         with torch.no_grad():
-            seq_tensor = torch.from_numpy(sequences).float().to(self.device)
-            rev_prob, direction_probs, magnitude = self.model(seq_tensor)
+            for start_idx in range(0, n_samples, batch_size):
+                end_idx = min(start_idx + batch_size, n_samples)
+                batch_seq = sequences[start_idx:end_idx]
+                seq_tensor = torch.from_numpy(batch_seq).float().to(self.device)
+
+                rev_prob, direction_probs, magnitude = self.model(seq_tensor)
+
+                all_rev_prob.append(rev_prob.cpu().numpy())
+                all_direction_probs.append(direction_probs.cpu().numpy())
+                all_magnitude.append(magnitude.cpu().numpy())
+
+        # Concatenate all batches
+        import numpy as np
+        all_rev_prob = np.concatenate(all_rev_prob)
+        all_direction_probs = np.concatenate(all_direction_probs)
+        all_magnitude = np.concatenate(all_magnitude)
 
         return PredictionResult(
-            reversal_prob=rev_prob.cpu().numpy(),
-            bull_prob=direction_probs[:, 1].cpu().numpy(),
-            bear_prob=direction_probs[:, 2].cpu().numpy(),
-            magnitude=magnitude.cpu().numpy()
+            reversal_prob=all_rev_prob,
+            bull_prob=all_direction_probs[:, 1],
+            bear_prob=all_direction_probs[:, 2],
+            magnitude=all_magnitude
         )
 
     def save(self, path: str) -> None:
@@ -604,10 +659,8 @@ class HybridReversalPredictor(BaseReversalPredictor):
         self.batch_size = batch_size
         self.num_epochs = num_epochs
 
-        if device is None:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        else:
-            self.device = device
+        # Device selection with fallback
+        self.device, self.pin_memory, self.num_workers = get_device(device)
 
         self.model: Optional[HybridModel] = None
         self.normalizer = NormalizationPipeline()
@@ -683,7 +736,13 @@ class HybridReversalPredictor(BaseReversalPredictor):
         dataset = torch.utils.data.TensorDataset(
             seq_tensor, htf_tensor, y_tensor, mag_tensor
         )
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            pin_memory=self.pin_memory,
+            num_workers=self.num_workers
+        )
 
         self.model.train()
         for epoch in range(self.num_epochs):
@@ -741,7 +800,7 @@ class HybridReversalPredictor(BaseReversalPredictor):
         return self.training_results
 
     def predict(self, bars: pd.DataFrame) -> PredictionResult:
-        """Make predictions."""
+        """Make predictions with batched inference to avoid OOM."""
         if self.model is None:
             raise ValueError("Model not trained.")
 
@@ -759,19 +818,43 @@ class HybridReversalPredictor(BaseReversalPredictor):
         # Prepare features
         htf_features = bars[self.feature_cols].fillna(0)
         htf_norm = self.normalizer.transform(htf_features)
+        htf_values = htf_norm.values
 
-        # Predict
+        # Batched prediction to avoid OOM
         self.model.eval()
+        batch_size = 1024
+        n_samples = len(sequences)
+
+        all_rev_prob = []
+        all_direction_probs = []
+        all_magnitude = []
+
         with torch.no_grad():
-            seq_tensor = torch.from_numpy(sequences).float().to(self.device)
-            htf_tensor = torch.from_numpy(htf_norm.values).float().to(self.device)
-            rev_prob, direction_probs, magnitude = self.model(seq_tensor, htf_tensor)
+            for start_idx in range(0, n_samples, batch_size):
+                end_idx = min(start_idx + batch_size, n_samples)
+                batch_seq = sequences[start_idx:end_idx]
+                batch_htf = htf_values[start_idx:end_idx]
+
+                seq_tensor = torch.from_numpy(batch_seq).float().to(self.device)
+                htf_tensor = torch.from_numpy(batch_htf).float().to(self.device)
+
+                rev_prob, direction_probs, magnitude = self.model(seq_tensor, htf_tensor)
+
+                all_rev_prob.append(rev_prob.cpu().numpy())
+                all_direction_probs.append(direction_probs.cpu().numpy())
+                all_magnitude.append(magnitude.cpu().numpy())
+
+        # Concatenate all batches
+        import numpy as np
+        all_rev_prob = np.concatenate(all_rev_prob)
+        all_direction_probs = np.concatenate(all_direction_probs)
+        all_magnitude = np.concatenate(all_magnitude)
 
         return PredictionResult(
-            reversal_prob=rev_prob.cpu().numpy(),
-            bull_prob=direction_probs[:, 1].cpu().numpy(),
-            bear_prob=direction_probs[:, 2].cpu().numpy(),
-            magnitude=magnitude.cpu().numpy()
+            reversal_prob=all_rev_prob,
+            bull_prob=all_direction_probs[:, 1],
+            bear_prob=all_direction_probs[:, 2],
+            magnitude=all_magnitude
         )
 
     def save(self, path: str) -> None:

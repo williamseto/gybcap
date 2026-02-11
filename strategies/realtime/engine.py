@@ -9,7 +9,7 @@ import pandas as pd
 
 from strategies.breakout.strategy import BreakoutRetestStrategy
 from strategies.reversion.strategy import ReversionStrategy
-from strategies.realtime.config import EngineConfig, StrategySlotConfig
+from strategies.realtime.config import EngineConfig, StrategySlotConfig, ReversalPredictorSlotConfig
 from strategies.realtime.data_source import MySQLSource, get_trading_day_start_ts
 from strategies.realtime.bar_aggregator import BarAggregator
 from strategies.realtime.level_provider import DayPriceLevelProvider
@@ -98,6 +98,34 @@ class RealtimeEngine:
                 pred_threshold=slot.pred_threshold,
             )
             self.register_strategy(adapter)
+
+        # Register reversal predictor if configured
+        rp_config = self.config.reversal_predictor
+        if rp_config is not None and rp_config.enabled:
+            self._register_reversal_predictor(rp_config)
+
+    def _register_reversal_predictor(self, rp_config: ReversalPredictorSlotConfig) -> None:
+        """Create and register the Phase 3 reversal predictor strategy."""
+        try:
+            from strategies.reversal.realtime_strategy import ReversalPredictorStrategy
+
+            strategy = ReversalPredictorStrategy(
+                model_dir=rp_config.model_dir,
+                pred_threshold=rp_config.pred_threshold,
+                proximity_pts=rp_config.proximity_pts,
+            )
+
+            # Load historical context for feature warm-up
+            if rp_config.historical_csv_path:
+                from strategies.realtime.csv_data_source import CSVDataSource
+                csv_source = CSVDataSource(rp_config.historical_csv_path)
+                now_ts = int(time.time())
+                history = csv_source.fetch_history_bars(now_ts, n_days=rp_config.warmup_days)
+                strategy.set_historical_context(history)
+
+            self.register_strategy(strategy)
+        except Exception as e:
+            logger.error("Failed to register reversal predictor: %s", e, exc_info=True)
 
     # ------------------------------------------------------------------
     # Lifecycle

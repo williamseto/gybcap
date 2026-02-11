@@ -501,6 +501,248 @@ class VariationalFeatureAutoencoder(nn.Module):
         return 1.0 / (1.0 + avg_error)
 
 
+class ContrastiveHybridAutoencoder(nn.Module):
+    """
+    Hybrid autoencoder with contrastive learning capability.
+
+    Extends HybridReversalAutoencoder with:
+    1. Projection head for contrastive learning
+    2. Classification head for direct prediction
+    3. Support for combined loss: reconstruction + contrastive + center
+
+    Training phases:
+    Phase 1: Pre-train on reversals only (reconstruction loss)
+    Phase 2: Fine-tune with contrastive loss on all data
+
+    This creates a latent space where:
+    - Reversal patterns have low reconstruction error
+    - Reversal embeddings cluster together
+    - Non-reversal embeddings are pushed apart
+    """
+
+    def __init__(
+        self,
+        seq_channels: int = 16,
+        seq_length: int = 60,
+        feature_dim: int = 18,
+        latent_dim: int = 32,
+        projection_dim: int = 64,
+        num_classes: int = 3,
+        tcn_hidden: int = 32,
+        tcn_levels: int = 3,
+        dropout: float = 0.2,
+        alpha: float = 0.5
+    ):
+        """
+        Initialize contrastive hybrid autoencoder.
+
+        Args:
+            seq_channels: Number of channels in sequence input
+            seq_length: Length of input sequence
+            feature_dim: Number of hand-crafted features
+            latent_dim: Dimension of fused latent space
+            projection_dim: Dimension of projection head output (for contrastive)
+            num_classes: Number of output classes (3 = none/bull/bear)
+            tcn_hidden: TCN encoder output dimension
+            tcn_levels: Number of TCN levels
+            dropout: Dropout rate
+            alpha: Weight for sequence loss vs feature loss
+        """
+        super().__init__()
+
+        self.seq_channels = seq_channels
+        self.seq_length = seq_length
+        self.feature_dim = feature_dim
+        self.latent_dim = latent_dim
+        self.projection_dim = projection_dim
+        self.num_classes = num_classes
+        self.tcn_hidden = tcn_hidden
+        self.alpha = alpha
+
+        # Sequence encoder
+        self.seq_encoder = TCNEncoder(
+            input_channels=seq_channels,
+            hidden_channels=tcn_hidden,
+            num_levels=tcn_levels,
+            dropout=dropout,
+            pool_type='max'
+        )
+
+        # Feature encoder
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(feature_dim, tcn_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(tcn_hidden, tcn_hidden)
+        )
+
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(tcn_hidden * 2, latent_dim),
+            nn.ReLU()
+        )
+
+        # Projection head for contrastive learning
+        # Maps latent to normalized embeddings for contrastive loss
+        self.projection_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, projection_dim)
+        )
+
+        # Classification head
+        self.classification_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim // 2, num_classes)
+        )
+
+        # Sequence decoder
+        self._seq_decoder_projection_dim = tcn_hidden * (seq_length // 4)
+        self.seq_decoder = nn.Sequential(
+            nn.Linear(latent_dim, self._seq_decoder_projection_dim),
+            nn.ReLU(),
+        )
+        self.seq_deconv = nn.Sequential(
+            nn.Unflatten(1, (tcn_hidden, seq_length // 4)),
+            nn.ConvTranspose1d(tcn_hidden, tcn_hidden // 2, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(tcn_hidden // 2, seq_channels, kernel_size=4, stride=2, padding=1),
+        )
+
+        # Feature decoder
+        self.feature_decoder = nn.Sequential(
+            nn.Linear(latent_dim, tcn_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(tcn_hidden, feature_dim)
+        )
+
+    def encode(
+        self,
+        seq: torch.Tensor,
+        features: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode to latent space."""
+        seq_emb = self.seq_encoder(seq)
+        feat_emb = self.feature_encoder(features)
+        combined = torch.cat([seq_emb, feat_emb], dim=1)
+        return self.fusion(combined)
+
+    def project(self, latent: torch.Tensor) -> torch.Tensor:
+        """Project latent to contrastive embedding space (L2 normalized)."""
+        proj = self.projection_head(latent)
+        return F.normalize(proj, dim=1)
+
+    def classify(self, latent: torch.Tensor) -> torch.Tensor:
+        """Get classification logits from latent."""
+        return self.classification_head(latent)
+
+    def decode(
+        self,
+        latent: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decode latent to reconstructions."""
+        seq_proj = self.seq_decoder(latent)
+        seq_recon = self.seq_deconv(seq_proj)
+        feat_recon = self.feature_decoder(latent)
+        return seq_recon, feat_recon
+
+    def forward(
+        self,
+        seq: torch.Tensor,
+        features: torch.Tensor,
+        return_all: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Full forward pass.
+
+        Args:
+            seq: Sequence tensor
+            features: Feature tensor
+            return_all: If True, return all outputs; else just logits
+
+        Returns:
+            Dictionary with outputs (latent, projection, logits, reconstructions)
+        """
+        latent = self.encode(seq, features)
+        projection = self.project(latent)
+        logits = self.classify(latent)
+
+        if return_all:
+            seq_recon, feat_recon = self.decode(latent)
+            return {
+                'latent': latent,
+                'projection': projection,
+                'logits': logits,
+                'seq_recon': seq_recon,
+                'feat_recon': feat_recon
+            }
+        else:
+            return {
+                'latent': latent,
+                'projection': projection,
+                'logits': logits
+            }
+
+    def reconstruction_error(
+        self,
+        seq: torch.Tensor,
+        features: torch.Tensor,
+        alpha: Optional[float] = None
+    ) -> torch.Tensor:
+        """Compute combined reconstruction error."""
+        if alpha is None:
+            alpha = self.alpha
+
+        latent = self.encode(seq, features)
+        seq_recon, feat_recon = self.decode(latent)
+
+        if seq.size(-1) == self.seq_channels:
+            seq = seq.permute(0, 2, 1)
+
+        seq_error = torch.mean((seq - seq_recon) ** 2, dim=(1, 2))
+        feat_error = torch.mean((features - feat_recon) ** 2, dim=1)
+
+        return alpha * seq_error + (1 - alpha) * feat_error
+
+    def anomaly_score(
+        self,
+        seq: torch.Tensor,
+        features: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute anomaly score (higher = more like reversal)."""
+        error = self.reconstruction_error(seq, features)
+        return 1.0 / (1.0 + error)
+
+    def get_embeddings(
+        self,
+        seq: torch.Tensor,
+        features: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get latent and projection embeddings for analysis.
+
+        Returns:
+            latent: Latent space embedding
+            projection: Normalized projection for contrastive comparison
+        """
+        latent = self.encode(seq, features)
+        projection = self.project(latent)
+        return latent, projection
+
+    def predict_proba(
+        self,
+        seq: torch.Tensor,
+        features: torch.Tensor
+    ) -> torch.Tensor:
+        """Get softmax probabilities for classification."""
+        latent = self.encode(seq, features)
+        logits = self.classify(latent)
+        return F.softmax(logits, dim=1)
+
+
 def create_autoencoder(
     model_type: str,
     feature_dim: int,
@@ -540,6 +782,14 @@ def create_autoencoder(
     elif model_type == 'vae':
         return VariationalFeatureAutoencoder(
             input_dim=feature_dim,
+            latent_dim=latent_dim,
+            **kwargs
+        )
+    elif model_type == 'contrastive':
+        return ContrastiveHybridAutoencoder(
+            seq_channels=seq_channels,
+            seq_length=seq_length,
+            feature_dim=feature_dim,
             latent_dim=latent_dim,
             **kwargs
         )

@@ -33,7 +33,7 @@ class PriceLevelProvider(BaseFeatureProvider):
     - Order flow imbalance z-score
     """
 
-    LEVEL_COLS = ['vwap', 'ovn_lo', 'ovn_hi', 'rth_lo', 'rth_hi']
+    LEVEL_COLS = ['vwap', 'ovn_lo', 'ovn_hi', 'rth_lo', 'rth_hi', 'ib_lo', 'ib_hi']
 
     FEATURE_COLS = [
         'close_z20', 'ovn_lo_z', 'ovn_hi_z', 'ib_lo_z', 'ib_hi_z',
@@ -130,6 +130,8 @@ class PriceLevelProvider(BaseFeatureProvider):
             # Fallback: create dummy time-based features
             group['ib_lo_z'] = 0.0
             group['ib_hi_z'] = 0.0
+            group['ib_lo'] = 0.0
+            group['ib_hi'] = 0.0
             group['rth_lo'] = 0.0
             group['rth_hi'] = 0.0
             group['vol_z'] = 0.0
@@ -138,28 +140,42 @@ class PriceLevelProvider(BaseFeatureProvider):
             return group
 
         try:
+            # Use between_time() on datetime-indexed df (matches realtime version)
             ib_df = time_df.between_time('6:30', '7:30')
             ib_lo = ib_df['low'].min() if not ib_df.empty else np.nan
             ib_hi = ib_df['high'].max() if not ib_df.empty else np.nan
 
-            ib_lo_z = (group['close'] - ib_lo) / vwap_std
-            ib_hi_z = (ib_hi - group['close']) / vwap_std
+            # Compute z-scores on datetime-indexed df
+            vwap_std_dt = vwap_std.values if not isinstance(vwap_std, np.ndarray) else vwap_std
+            vwap_std_series = pd.Series(vwap_std_dt, index=time_df.index)
+            ib_lo_z = (time_df['close'] - ib_lo) / vwap_std_series
+            ib_hi_z = (ib_hi - time_df['close']) / vwap_std_series
 
-            group['ib_lo_z'] = 0.0
-            group['ib_hi_z'] = 0.0
+            time_df['ib_lo_z'] = 0.0
+            time_df['ib_hi_z'] = 0.0
+            time_df['ib_lo'] = 0.0
+            time_df['ib_hi'] = 0.0
 
-            rth_after_ib_idx = group.index[time_df.index.indexer_between_time('7:30', '12:59')]
-            group.loc[rth_after_ib_idx, 'ib_lo_z'] = ib_lo_z.loc[rth_after_ib_idx]
-            group.loc[rth_after_ib_idx, 'ib_hi_z'] = ib_hi_z.loc[rth_after_ib_idx]
+            rth_after_ib_idx = time_df.between_time('7:30', '12:59').index
+            time_df.loc[rth_after_ib_idx, 'ib_lo_z'] = ib_lo_z.loc[rth_after_ib_idx]
+            time_df.loc[rth_after_ib_idx, 'ib_hi_z'] = ib_hi_z.loc[rth_after_ib_idx]
+            time_df.loc[rth_after_ib_idx, 'ib_lo'] = ib_lo
+            time_df.loc[rth_after_ib_idx, 'ib_hi'] = ib_hi
 
-            # RTH high/low
-            group['rth_lo'] = 0.0
-            group['rth_hi'] = 0.0
-            group.loc[rth_after_ib_idx, 'rth_lo'] = group.loc[rth_after_ib_idx, 'low'].cummin()
-            group.loc[rth_after_ib_idx, 'rth_hi'] = group.loc[rth_after_ib_idx, 'high'].cummax()
+            # RTH high/low (cumulative after IB)
+            time_df['rth_lo'] = 0.0
+            time_df['rth_hi'] = 0.0
+            time_df.loc[rth_after_ib_idx, 'rth_lo'] = time_df.loc[rth_after_ib_idx, 'low'].cummin()
+            time_df.loc[rth_after_ib_idx, 'rth_hi'] = time_df.loc[rth_after_ib_idx, 'high'].cummax()
+
+            # Map results back to original integer-indexed group
+            for col in ['ib_lo_z', 'ib_hi_z', 'ib_lo', 'ib_hi', 'rth_lo', 'rth_hi']:
+                group[col] = time_df[col].values
         except Exception:
             group['ib_lo_z'] = 0.0
             group['ib_hi_z'] = 0.0
+            group['ib_lo'] = 0.0
+            group['ib_hi'] = 0.0
             group['rth_lo'] = 0.0
             group['rth_hi'] = 0.0
 
@@ -232,7 +248,7 @@ class PriceLevelProvider(BaseFeatureProvider):
         if 'nearby_gamma_score' not in self._ohlcv_feat.columns and 'nearby_gamma_score' in feat_cols:
             feat_cols.remove('nearby_gamma_score')
 
-        merge_cols = ['dt', 'vwap', 'ovn_lo', 'ovn_hi', 'ovn', 'rth_lo', 'rth_hi'] + feat_cols
+        merge_cols = ['dt', 'vwap', 'ovn_lo', 'ovn_hi', 'ovn', 'rth_lo', 'rth_hi', 'ib_lo', 'ib_hi'] + feat_cols
 
         # Only include columns that exist
         merge_cols = [c for c in merge_cols if c in self._ohlcv_feat.columns]

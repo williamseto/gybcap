@@ -13,6 +13,7 @@ from strategies.reversal.autoencoder import (
     HybridReversalAutoencoder,
     create_autoencoder
 )
+from strategies.reversal.causal_model import CausalZoneModel, FocalLoss
 
 __all__ = [
     "NormalizationPipeline",
@@ -24,4 +25,6 @@ __all__ = [
     "FeatureOnlyAutoencoder",
     "HybridReversalAutoencoder",
     "create_autoencoder",
+    "CausalZoneModel",
+    "FocalLoss",
 ]

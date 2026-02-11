@@ -36,6 +36,15 @@ class ReversionQualityProvider(BaseFeatureProvider):
         'level_touch_count',       # First touch vs repeated tests
         'bars_since_rth_open',     # Time of day effect
         'bar_momentum',            # Close - open direction strength
+        # Multi-bar rejection patterns (Phase 1 additions)
+        'rejection_bar_count_3',   # Rejection bars in last 3
+        'max_wick_ratio_3bar',     # Max wick ratio in 3-bar window
+        'bar_momentum_reversal',   # Did momentum change direction?
+        # Approach dynamics features
+        'vol_trend_into_level',    # Slope of volume over 10-bar approach
+        'bar_size_trend_into_level',  # Slope of bar ranges over 10-bar approach
+        'consecutive_same_dir',    # Consecutive bars moving toward level
+        'approach_cum_delta_z',    # Z-scored cumulative delta over approach
     ]
 
     def __init__(
@@ -197,7 +206,7 @@ class ReversionQualityProvider(BaseFeatureProvider):
         context: Optional[Dict[str, Any]] = None
     ) -> pd.DataFrame:
         """
-        Compute reversion quality features for all bars.
+        Compute reversion quality features for all bars (vectorized).
 
         Note: Features are most meaningful when computed at specific trigger bars.
         This implementation computes generic bar-quality features using VWAP as
@@ -205,45 +214,177 @@ class ReversionQualityProvider(BaseFeatureProvider):
         """
         result = ohlcv.copy()
 
-        # Initialize feature columns
-        for feat in self.feature_names:
-            result[feat] = 0.0
+        # Extract arrays for vectorized operations
+        open_arr = ohlcv['open'].values.astype(np.float64)
+        high_arr = ohlcv['high'].values.astype(np.float64)
+        low_arr = ohlcv['low'].values.astype(np.float64)
+        close_arr = ohlcv['close'].values.astype(np.float64)
 
-        # Compute rolling range statistics
-        bar_ranges = (ohlcv['high'] - ohlcv['low']).values
+        # Bar range with minimum to avoid division by zero
+        bar_range = np.maximum(high_arr - low_arr, 0.01)
+        body = np.maximum(np.abs(close_arr - open_arr), 0.01)
 
-        for i in range(len(ohlcv)):
-            bar = ohlcv.iloc[i]
+        # Direction: True = bull, False = bear
+        is_bull = close_arr >= open_arr
 
-            # Get reference level (use VWAP if available)
-            if 'vwap' in ohlcv.columns and not pd.isna(bar.get('vwap')):
-                level = bar['vwap']
+        # Wick calculation (vectorized)
+        # Bull: wick = (o - l) if c >= o else (c - l)
+        # Bear: wick = (h - o) if c <= o else (h - c)
+        bull_wick = np.where(is_bull, open_arr - low_arr, close_arr - low_arr)
+        bear_wick = np.where(~is_bull, high_arr - open_arr, high_arr - close_arr)
+        wick = np.where(is_bull, bull_wick, bear_wick)
+        wick = np.maximum(wick, 0.0)
+
+        # Wick features
+        result['wick_to_body_ratio'] = wick / body
+        result['rejection_wick_pct'] = wick / bar_range
+
+        # Close position: (close - low) / range
+        result['close_position'] = (close_arr - low_arr) / bar_range
+
+        # Bar momentum: (close - open) / range
+        result['bar_momentum'] = (close_arr - open_arr) / bar_range
+
+        # Bar range z-score (rolling 20-bar window)
+        range_series = pd.Series(bar_range)
+        rolling_mean = range_series.rolling(window=20, min_periods=1).mean()
+        rolling_std = range_series.rolling(window=20, min_periods=1).std().fillna(0.01)
+        rolling_std = rolling_std.replace(0, 0.01)
+        result['bar_range_z'] = (bar_range - rolling_mean.values) / rolling_std.values
+
+        # Reference level for penetration (VWAP if available, else midpoint)
+        if 'vwap' in ohlcv.columns:
+            level = ohlcv['vwap'].fillna(pd.Series((high_arr + low_arr) / 2, index=ohlcv.index)).values
+        else:
+            level = (high_arr + low_arr) / 2
+
+        # Rejection penetration (vectorized)
+        # Bull: max(level - low, 0), Bear: max(high - level, 0)
+        bull_penetration = np.maximum(level - low_arr, 0)
+        bear_penetration = np.maximum(high_arr - level, 0)
+        penetration = np.where(is_bull, bull_penetration, bear_penetration)
+        result['rejection_penetration'] = penetration / np.maximum(level * 0.001, 0.01)
+
+        # Bars since RTH open (vectorized per day)
+        if 'trading_day' in ohlcv.columns and 'ovn' in ohlcv.columns:
+            bars_since_open = np.zeros(len(ohlcv), dtype=np.float64)
+            for day, day_df in ohlcv.groupby('trading_day'):
+                day_mask = ohlcv['trading_day'] == day
+                rth_mask = day_mask & (ohlcv['ovn'] == 0)
+                rth_count = rth_mask.cumsum()
+                # Only count within RTH bars
+                bars_since_open[day_mask.values] = np.where(
+                    ohlcv.loc[day_mask, 'ovn'].values == 0,
+                    rth_count[day_mask].values - rth_count[rth_mask].values.min() if rth_mask.any() else 0,
+                    0
+                )
+            result['bars_since_rth_open'] = bars_since_open
+        else:
+            result['bars_since_rth_open'] = np.arange(len(ohlcv), dtype=np.float64)
+
+        # Level touch count (simplified: use rolling window count of touches)
+        # This is approximated since exact touch counting is expensive
+        # Count how many times low or high came within threshold of VWAP
+        threshold = np.abs(level) * self.touch_threshold_pct
+        touched = (
+            ((low_arr >= level - threshold) & (low_arr <= level + threshold)) |
+            ((high_arr >= level - threshold) & (high_arr <= level + threshold))
+        )
+        touch_series = pd.Series(touched.astype(float))
+        result['level_touch_count'] = touch_series.rolling(
+            window=self.lookback_touches, min_periods=1
+        ).sum().values
+
+        # --- Multi-bar rejection pattern features (Phase 1 additions) ---
+
+        # Count rejection bars in last 3 (wick_to_body_ratio > 0.5)
+        wick_to_body_series = pd.Series(result['wick_to_body_ratio'].values)
+        is_rejection_bar = (wick_to_body_series > 0.5).astype(float)
+        result['rejection_bar_count_3'] = is_rejection_bar.rolling(
+            window=3, min_periods=1
+        ).sum().values
+
+        # Max wick ratio in 3-bar window
+        result['max_wick_ratio_3bar'] = wick_to_body_series.rolling(
+            window=3, min_periods=1
+        ).max().values
+
+        # Bar momentum reversal (did momentum change direction?)
+        # Compare current bar momentum sign to previous bar
+        bar_momentum = result['bar_momentum'].values
+        momentum_series = pd.Series(bar_momentum)
+        prev_momentum = momentum_series.shift(1).fillna(0).values
+        momentum_reversal = (
+            ((bar_momentum > 0) & (prev_momentum < 0)) |
+            ((bar_momentum < 0) & (prev_momentum > 0))
+        )
+        result['bar_momentum_reversal'] = momentum_reversal.astype(float)
+
+        # --- Approach dynamics features ---
+
+        # Volume trend into level (slope of volume over 10-bar lookback)
+        vol_series = pd.Series(ohlcv['volume'].values.astype(np.float64))
+        x_10 = np.arange(10, dtype=np.float64)
+        x_10_mean = x_10.mean()
+        x_10_var = ((x_10 - x_10_mean) ** 2).sum()
+
+        def _rolling_slope(series: pd.Series, window: int = 10) -> np.ndarray:
+            """Compute rolling OLS slope (normalized)."""
+            n = len(series)
+            slopes = np.zeros(n, dtype=np.float64)
+            vals = series.values
+            x = np.arange(window, dtype=np.float64)
+            x_m = x.mean()
+            x_v = ((x - x_m) ** 2).sum()
+            if x_v == 0:
+                return slopes
+            for t in range(window, n):
+                y = vals[t - window:t]
+                y_m = y.mean()
+                if y_m == 0:
+                    continue
+                cov = ((x - x_m) * (y - y_m)).sum()
+                slopes[t] = cov / x_v / max(abs(y_m), 1e-6)
+            return slopes
+
+        result['vol_trend_into_level'] = np.clip(_rolling_slope(vol_series, 10), -3, 3)
+
+        # Bar size trend (slope of bar ranges over 10-bar approach)
+        range_series = pd.Series(bar_range)
+        result['bar_size_trend_into_level'] = np.clip(_rolling_slope(range_series, 10), -3, 3)
+
+        # Consecutive same-direction bars (count of bars moving same direction)
+        close_diff = np.diff(close_arr, prepend=close_arr[0])
+        is_up = close_diff > 0
+        is_down = close_diff < 0
+
+        consec = np.zeros(len(close_arr), dtype=np.float64)
+        for t in range(1, len(close_arr)):
+            if is_up[t] and is_up[t - 1]:
+                consec[t] = consec[t - 1] + 1
+            elif is_down[t] and is_down[t - 1]:
+                consec[t] = consec[t - 1] + 1
             else:
-                level = (bar['high'] + bar['low']) / 2
+                consec[t] = 0
+        result['consecutive_same_dir'] = consec
 
-            # Determine direction based on close vs open
-            direction = 'bull' if bar['close'] >= bar['open'] else 'bear'
+        # Approach cumulative delta z-score (order flow direction over 10 bars)
+        if 'bidvolume' in ohlcv.columns and 'askvolume' in ohlcv.columns:
+            bid_vol = ohlcv['bidvolume'].fillna(0).values.astype(np.float64)
+            ask_vol = ohlcv['askvolume'].fillna(0).values.astype(np.float64)
+            delta = bid_vol - ask_vol
+        else:
+            # Approximate delta from close position
+            close_pos = (close_arr - low_arr) / bar_range
+            delta = (close_pos - 0.5) * ohlcv['volume'].values.astype(np.float64)
 
-            # Recent ranges for z-score
-            start_idx = max(0, i - 20)
-            recent_ranges = bar_ranges[start_idx:i] if i > 0 else None
-
-            # Count touches
-            touch_count = self._count_level_touches(ohlcv, i, level)
-
-            # Bars since RTH open
-            bars_since_open = self._get_rth_bar_index(ohlcv, i)
-
-            # Compute features
-            features = self.compute_bar_quality_features(
-                bar, level, direction,
-                touch_count=touch_count,
-                bars_since_open=bars_since_open,
-                recent_ranges=recent_ranges
-            )
-
-            for feat_name, feat_val in features.items():
-                result.iloc[i, result.columns.get_loc(feat_name)] = feat_val
+        delta_series = pd.Series(delta)
+        cum_delta_10 = delta_series.rolling(window=10, min_periods=1).sum()
+        cum_delta_mean = cum_delta_10.rolling(window=50, min_periods=1).mean()
+        cum_delta_std = cum_delta_10.rolling(window=50, min_periods=1).std().replace(0, 1)
+        result['approach_cum_delta_z'] = np.clip(
+            ((cum_delta_10 - cum_delta_mean) / cum_delta_std).fillna(0).values, -5, 5
+        )
 
         return result
 

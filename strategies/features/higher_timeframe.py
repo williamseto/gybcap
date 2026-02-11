@@ -139,6 +139,26 @@ class HigherTimeframeProvider(BaseFeatureProvider):
         'intraday_bb_width_z',    # Band width vs recent average
     ]
 
+    # Range exhaustion features
+    RANGE_EXHAUSTION_FEATURES = [
+        'range_pct_of_atr',          # Today's running range / ATR_14
+        'range_pct_of_prior_range',  # Today's range / prior day range
+        'distance_from_open_atr',    # |close - open| / ATR_14
+        'session_range_percentile',  # Today's range as percentile of last 20 sessions
+        'remaining_atr_pct',         # (ATR - today's range) / ATR
+        'prior_va_width_actual',     # Prior day VA width (from OHLC approximation)
+    ]
+
+    # Directional context features
+    DIRECTIONAL_CONTEXT_FEATURES = [
+        'bb_side_alignment',         # +1 at lower BB + support, -1 at upper BB + resistance
+        'trend_exhaustion_score',    # RSI × BB %B interaction
+        'weekly_trend_alignment',    # +1 if weekly trend supports reversal
+        'approach_velocity_10bar',   # Normalized approach speed
+        'approach_deceleration',     # Velocity change (slowing = reversal hint?)
+        'bars_since_session_extreme', # Bars since today's high/low set
+    ]
+
     def __init__(
         self,
         daily_sma_short: int = 20,
@@ -186,7 +206,9 @@ class HigherTimeframeProvider(BaseFeatureProvider):
             self.PRIOR_DAY_FEATURES +
             self.GAP_FEATURES +
             self.WEEKLY_FEATURES +
-            self.INTRADAY_BB_FEATURES
+            self.INTRADAY_BB_FEATURES +
+            self.RANGE_EXHAUSTION_FEATURES +
+            self.DIRECTIONAL_CONTEXT_FEATURES
         )
 
     def _aggregate_to_daily(self, ohlcv: pd.DataFrame) -> pd.DataFrame:
@@ -266,8 +288,32 @@ class HigherTimeframeProvider(BaseFeatureProvider):
         poc_position = (df['close'] - df['low']) / day_range.replace(0, np.nan)
         df['prior_poc_rel'] = poc_position.shift(1).fillna(0.5)
 
-        # VA width (simplified: assume 70% of range)
-        df['prior_va_width_rel'] = 0.7  # Placeholder - would need actual VP calculation
+        # VA width: approximate from IQR of close prices within the day
+        # (better than hardcoded 0.7 — uses actual price distribution)
+        df['prior_va_width_rel'] = 0.7  # Default, overwritten below
+        for i in range(1, len(df)):
+            prior_range = df.iloc[i - 1]['high'] - df.iloc[i - 1]['low']
+            if prior_range > 0:
+                # Approximate VA as middle 70% of range using POC-centered estimate
+                poc_rel = poc_position.iloc[i - 1] if not pd.isna(poc_position.iloc[i - 1]) else 0.5
+                # Wider VA when POC is centered, narrower at extremes
+                va_est = 0.5 + 0.3 * (1 - abs(poc_rel - 0.5) * 2)
+                df.iloc[i, df.columns.get_loc('prior_va_width_rel')] = va_est
+
+        # Range exhaustion features (daily-level, mapped later)
+        df['range_pct_of_prior_range'] = (
+            (df['high'] - df['low']) / df['prior_day_range'].replace(0, np.nan)
+        ).fillna(1.0)
+
+        # Session range percentile (last 20 sessions)
+        day_ranges = df['high'] - df['low']
+        rolling_rank = day_ranges.rolling(window=20, min_periods=1).apply(
+            lambda x: (x.iloc[-1] >= x).sum() / len(x), raw=False
+        )
+        df['session_range_percentile'] = rolling_rank.fillna(0.5)
+
+        # Prior VA width actual (from VP-like approximation)
+        df['prior_va_width_actual'] = df['prior_va_width_rel'] * df['prior_day_range']
 
         # Gap features
         prior_close = df['close'].shift(1)
@@ -379,9 +425,8 @@ class HigherTimeframeProvider(BaseFeatureProvider):
         """
         result = ohlcv.copy()
 
-        # Initialize all feature columns
-        for feat in self.feature_names:
-            result[feat] = 0.0
+        # Note: Don't pre-initialize feature columns - let merge add them
+        # (Pre-initializing causes merge to use suffixes instead of overwriting)
 
         # Aggregate to daily
         daily = self._aggregate_to_daily(ohlcv)
@@ -393,53 +438,190 @@ class HigherTimeframeProvider(BaseFeatureProvider):
         weekly = self._compute_weekly_features(weekly)
         self._weekly_cache = weekly
 
-        # Map daily features to intraday bars
+        # Map daily features to intraday bars (vectorized merge)
         daily_feature_cols = (
             self.DAILY_TREND_FEATURES +
             self.DAILY_BB_FEATURES +
             self.PRIOR_DAY_FEATURES +
-            ['gap_pct', 'gap_vs_prior_range', 'open_vs_prior_va']
+            ['gap_pct', 'gap_vs_prior_range', 'open_vs_prior_va',
+             'range_pct_of_prior_range', 'session_range_percentile',
+             'prior_va_width_actual']
         )
 
-        day_to_features = daily.set_index('trading_day')[
-            [c for c in daily_feature_cols if c in daily.columns]
-        ].to_dict('index')
-
-        for idx, row in result.iterrows():
-            day = row['trading_day']
-            if day in day_to_features:
-                for feat, val in day_to_features[day].items():
-                    result.loc[idx, feat] = val if pd.notna(val) else 0.0
+        daily_cols_available = [c for c in daily_feature_cols if c in daily.columns]
+        if daily_cols_available:
+            daily_subset = daily[['trading_day'] + daily_cols_available].copy()
+            # Use merge for fast vectorized mapping
+            result = result.merge(
+                daily_subset,
+                on='trading_day',
+                how='left'
+            )
+            # Fill NaN with 0
+            for col in daily_cols_available:
+                if col in result.columns:
+                    result[col] = result[col].fillna(0.0)
 
         # Compute gap_filled (intraday update)
         result['gap_filled'] = self._compute_gap_filled(ohlcv, daily)
 
-        # Map weekly features to intraday bars
+        # Map weekly features to intraday bars (vectorized merge)
         # Create week lookup from daily
         daily['year_week'] = (
             pd.to_datetime(daily['trading_day']).dt.isocalendar().year.astype(str) +
             '_' +
             pd.to_datetime(daily['trading_day']).dt.isocalendar().week.astype(str).str.zfill(2)
         )
-        day_to_week = daily.set_index('trading_day')['year_week'].to_dict()
 
         weekly_feature_cols = self.WEEKLY_FEATURES
-        week_to_features = weekly.set_index('year_week')[
-            [c for c in weekly_feature_cols if c in weekly.columns]
-        ].to_dict('index')
+        weekly_cols_available = [c for c in weekly_feature_cols if c in weekly.columns]
 
-        for idx, row in result.iterrows():
-            day = row['trading_day']
-            week = day_to_week.get(day)
-            if week and week in week_to_features:
-                for feat, val in week_to_features[week].items():
-                    result.loc[idx, feat] = val if pd.notna(val) else 0.0
+        if weekly_cols_available:
+            # Create day-to-week mapping
+            day_week_map = daily[['trading_day', 'year_week']].copy()
+            # Get weekly features
+            weekly_subset = weekly[['year_week'] + weekly_cols_available].copy()
+            # Merge day to week, then to result
+            day_week_features = day_week_map.merge(weekly_subset, on='year_week', how='left')
+            result = result.merge(
+                day_week_features[['trading_day'] + weekly_cols_available],
+                on='trading_day',
+                how='left'
+            )
+            # Fill NaN with 0
+            for col in weekly_cols_available:
+                if col in result.columns:
+                    result[col] = result[col].fillna(0.0)
 
         # Compute intraday Bollinger Band features
         intraday_bb = self._compute_intraday_bb_features(ohlcv)
         for feat in self.INTRADAY_BB_FEATURES:
             if feat in intraday_bb.columns:
                 result[feat] = intraday_bb[feat].values
+
+        # --- Range exhaustion features (intraday) ---
+        result = self._compute_range_exhaustion_features(result, daily)
+
+        # --- Directional context features (intraday) ---
+        result = self._compute_directional_context_features(result, daily)
+
+        return result
+
+    def _compute_range_exhaustion_features(
+        self, result: pd.DataFrame, daily: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Compute intraday range exhaustion features."""
+        # Build ATR lookup
+        atr_map = daily.set_index('trading_day')['daily_atr_14'].to_dict()
+        prior_range_map = daily.set_index('trading_day')['prior_day_range'].to_dict()
+
+        # Map daily-level features that were computed in _compute_daily_features
+        daily_range_feats = ['range_pct_of_prior_range', 'session_range_percentile',
+                             'prior_va_width_actual']
+        for feat in daily_range_feats:
+            if feat in daily.columns:
+                feat_map = daily.set_index('trading_day')[feat].to_dict()
+                result[feat] = result['trading_day'].map(feat_map).fillna(0.0)
+
+        # Intraday running range / ATR (updates every bar)
+        range_pct_of_atr = np.zeros(len(result), dtype=np.float64)
+        distance_from_open_atr = np.zeros(len(result), dtype=np.float64)
+        remaining_atr_pct = np.ones(len(result), dtype=np.float64)
+
+        for day, day_df in result.groupby('trading_day'):
+            day_mask = result['trading_day'] == day
+            atr = atr_map.get(day, 0)
+            if atr <= 0:
+                continue
+
+            close_vals = result.loc[day_mask, 'close'].values
+            high_vals = result.loc[day_mask, 'high'].values
+            low_vals = result.loc[day_mask, 'low'].values
+
+            # Running range (cumulative high - cumulative low)
+            cum_high = np.maximum.accumulate(high_vals)
+            cum_low = np.minimum.accumulate(low_vals)
+            running_range = cum_high - cum_low
+
+            range_pct_of_atr[day_mask.values] = running_range / atr
+            distance_from_open_atr[day_mask.values] = np.abs(close_vals - close_vals[0]) / atr
+            remaining_atr_pct[day_mask.values] = np.maximum(atr - running_range, 0) / atr
+
+        result['range_pct_of_atr'] = range_pct_of_atr
+        result['distance_from_open_atr'] = distance_from_open_atr
+        result['remaining_atr_pct'] = remaining_atr_pct
+
+        return result
+
+    def _compute_directional_context_features(
+        self, result: pd.DataFrame, daily: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Compute directional context features."""
+        close_arr = result['close'].values.astype(np.float64)
+        n = len(result)
+
+        # BB side alignment: +1 if at lower BB + support level, -1 if at upper BB + resistance
+        bb_pct_b = result.get('daily_bb_pct_b', pd.Series(np.full(n, 0.5))).values
+        # At lower BB extreme (<0.1) → price likely at support → favor reversal up (+1)
+        # At upper BB extreme (>0.9) → price likely at resistance → favor reversal down (-1)
+        result['bb_side_alignment'] = np.where(
+            bb_pct_b < 0.1, 1.0,
+            np.where(bb_pct_b > 0.9, -1.0, 0.0)
+        )
+
+        # Trend exhaustion score: RSI × BB interaction
+        rsi = result.get('daily_rsi_14', pd.Series(np.full(n, 50.0))).values
+        # High RSI + high %B = overbought exhaustion (positive score)
+        # Low RSI + low %B = oversold exhaustion (positive score)
+        rsi_norm = (rsi - 50) / 50  # -1 to 1
+        bb_norm = bb_pct_b * 2 - 1  # -1 to 1
+        result['trend_exhaustion_score'] = np.clip(rsi_norm * bb_norm, -1, 1)
+
+        # Weekly trend alignment
+        weekly_bb = result.get('weekly_bb_pct_b', pd.Series(np.full(n, 0.5))).values
+        # Weekly at extreme + daily at same extreme = exhaustion (favor reversal)
+        result['weekly_trend_alignment'] = np.where(
+            (weekly_bb < 0.2) & (bb_pct_b < 0.2), 1.0,  # Oversold on both → bullish reversal
+            np.where(
+                (weekly_bb > 0.8) & (bb_pct_b > 0.8), -1.0,  # Overbought on both → bearish reversal
+                0.0
+            )
+        )
+
+        # Approach velocity (10-bar normalized by ATR)
+        atr_arr = result.get('daily_atr_14', pd.Series(np.ones(n))).values
+        atr_arr = np.maximum(atr_arr, 0.01)
+        close_series = pd.Series(close_arr)
+        velocity_10 = close_series.diff(10).fillna(0).values / 10 / atr_arr
+        result['approach_velocity_10bar'] = np.clip(velocity_10, -3, 3)
+
+        # Approach deceleration (velocity change)
+        velocity_5 = close_series.diff(5).fillna(0).values / 5 / atr_arr
+        velocity_prev_5 = close_series.shift(5).diff(5).fillna(0).values / 5 / atr_arr
+        result['approach_deceleration'] = np.clip(velocity_5 - velocity_prev_5, -3, 3)
+
+        # Bars since session extreme
+        bars_since_extreme = np.zeros(n, dtype=np.float64)
+        for day, day_df in result.groupby('trading_day'):
+            day_mask = result['trading_day'] == day
+            high_vals = result.loc[day_mask, 'high'].values
+            low_vals = result.loc[day_mask, 'low'].values
+            T = len(high_vals)
+
+            cum_high = np.maximum.accumulate(high_vals)
+            cum_low = np.minimum.accumulate(low_vals)
+
+            # Track when new extremes were set
+            last_extreme_bar = np.zeros(T, dtype=np.float64)
+            last_new = 0
+            for t in range(T):
+                if t == 0 or high_vals[t] >= cum_high[t - 1] or low_vals[t] <= cum_low[t - 1]:
+                    last_new = t
+                last_extreme_bar[t] = t - last_new
+
+            bars_since_extreme[day_mask.values] = last_extreme_bar
+
+        result['bars_since_session_extreme'] = bars_since_extreme
 
         return result
 

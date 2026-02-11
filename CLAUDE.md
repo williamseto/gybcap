@@ -170,22 +170,38 @@ From CV analysis:
 }
 ```
 
-### Experimentation Script
-Run feature analysis:
+### V3 Causal Zone Prediction (Feb 2026)
+
+Previous V1/V2 multi-scale models used 1-sec data and were found to be
+lookahead-biased (see `strategies/reversal/NONCAUSAL_NOTES.md`). V3 uses
+1-min bars only with zone-based labeling.
+
+**Key idea**: Predict P(pre-reversal zone) at every bar near a price level,
+learning approach patterns rather than reacting to a precise trigger bar.
+
 ```bash
 source ~/ml-venv/bin/activate
-python sandbox/test_volume_features.py --data raw_data/es_min_3y_clean_td_gamma.csv
+
+# Full experiment — XGBoost + V3 neural model
+PYTHONPATH=/home/william/gybcap python -u sandbox/train_causal.py
+
+# XGBoost only (~5 min)
+PYTHONPATH=/home/william/gybcap python -u sandbox/train_causal.py --xgboost-only
+
+# V3 neural only
+PYTHONPATH=/home/william/gybcap python -u sandbox/train_causal.py --v3-only
 ```
 
-This compares:
-1. Price-only baseline
-2. Volume features only
-3. Quality features only
-4. All features combined
+Key modules:
+- `strategies/labeling/reversal_zones.py` — `LevelAnchoredZoneLabeler`
+- `strategies/features/zone_features.py` — Scalar + VP heatmap extraction
+- `strategies/reversal/causal_model.py` — V3 model (VPBranchCNN + TCN + scalars)
+- `strategies/reversal/causal_trainer.py` — Walk-forward XGBoost + V3 trainer
 
 ### Success Criteria
 | Metric | Baseline | Target |
 |--------|----------|--------|
-| Feature |corr| | < 0.04 | > 0.05 (at least 3 features) |
-| OOS Win Rate | 35% | > 40% |
-| Overfitting Gap | 28% | < 15% |
+| Zone detection ROC-AUC | 0.50 | > 0.60 |
+| Zone precision at P>0.5 | — | > 40% |
+| Trading WR (P>threshold) | base rate | > 45% |
+| E[PnL/trade] | ~-0.40pt | > 0.00pt |

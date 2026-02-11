@@ -12,7 +12,7 @@ Usage:
 """
 
 from strategies.realtime.protocol import RealtimeSignal, RealtimeStrategy, BatchStrategyAdapter
-from strategies.realtime.config import EngineConfig, StrategySlotConfig, DatabaseConfig
+from strategies.realtime.config import EngineConfig, StrategySlotConfig, DatabaseConfig, ReversalPredictorSlotConfig
 from strategies.realtime.engine import RealtimeEngine
 
 __all__ = [
@@ -22,5 +22,6 @@ __all__ = [
     "EngineConfig",
     "StrategySlotConfig",
     "DatabaseConfig",
+    "ReversalPredictorSlotConfig",
     "RealtimeEngine",
 ]
