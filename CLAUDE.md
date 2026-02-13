@@ -88,10 +88,23 @@ engine.run()
 ```
 
 ### graveyard/
-Archived legacy code (replaced by `strategies/realtime/`):
-- `graveyard/util/test_client.py` - Old monolithic real-time client
-- `graveyard/util/strategy_util.py` - Old duplicated strategy implementations
-- `graveyard/util/client_util.py` - Old data fetch utilities
+Archived legacy code and deprecated implementations. See `graveyard/GRAVEYARD.md` for full documentation.
+
+**Recent Migrations (Feb 2026)**:
+- `graveyard/2026-02-feb/deprecated_strategies/` - Old monolithic strategies
+  - `test_bo_retest.py` (837 lines) - Replaced by `strategies/` package
+  - `pred_util.py` (976 lines) - TCN models ported to `strategies/reversal/tcn_model.py`
+  - `test_pipe_real.py` (238 lines) - Old prediction pipeline
+- `graveyard/2026-02-feb/root_scripts/` - Orphaned test scripts (11 files, 1,469 lines)
+
+**Previous Migrations**:
+- `graveyard/util/` - Old monolithic real-time client (replaced by `strategies/realtime/`)
+  - `test_client.py`, `strategy_util.py`, `client_util.py`
+- `graveyard/sandbox/` - Pre-2026 experiments
+- `graveyard/root_scripts/` - Previous cleanup
+- `graveyard/vp/` - Old VP pipeline
+
+**Total Archived**: 29+ files, 7,500+ lines (git history preserved via `git mv`)
 
 ### Data
 - Primary: `raw_data/es_min_3y_clean_td_gamma.csv` (1-min ES futures with gamma)
