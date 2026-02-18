@@ -12,8 +12,9 @@ Usage:
 """
 
 from strategies.realtime.protocol import RealtimeSignal, RealtimeStrategy, BatchStrategyAdapter
-from strategies.realtime.config import EngineConfig, StrategySlotConfig, DatabaseConfig, ReversalPredictorSlotConfig
+from strategies.realtime.config import EngineConfig, StrategySlotConfig, DatabaseConfig, ReversalPredictorSlotConfig, PlaybackConfig
 from strategies.realtime.engine import RealtimeEngine
+from strategies.realtime.playback import PlaybackRunner
 
 __all__ = [
     "RealtimeSignal",
@@ -23,5 +24,7 @@ __all__ = [
     "StrategySlotConfig",
     "DatabaseConfig",
     "ReversalPredictorSlotConfig",
+    "PlaybackConfig",
     "RealtimeEngine",
+    "PlaybackRunner",
 ]

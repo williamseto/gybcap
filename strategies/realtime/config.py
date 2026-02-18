@@ -54,6 +54,15 @@ class ReversalPredictorSlotConfig:
 
 
 @dataclass
+class PlaybackConfig:
+    """Configuration for CSV playback mode."""
+    csv_path: str = ''
+    playback_days: Optional[List[str]] = None
+    n_days: int = 2
+    warmup_days: int = 0
+
+
+@dataclass
 class EngineConfig:
     """Top-level engine configuration."""
     db: DatabaseConfig = field(default_factory=DatabaseConfig)

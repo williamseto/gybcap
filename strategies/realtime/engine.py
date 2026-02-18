@@ -36,11 +36,11 @@ class RealtimeEngine:
     and signal dispatch in a real-time loop.
     """
 
-    def __init__(self, config: EngineConfig):
+    def __init__(self, config: EngineConfig, data_source=None):
         self.config = config
 
         # Data pipeline
-        self.data_source = MySQLSource(config.db)
+        self.data_source = data_source or MySQLSource(config.db)
         self.aggregator = BarAggregator()
         self.level_provider = DayPriceLevelProvider(self.data_source)
 

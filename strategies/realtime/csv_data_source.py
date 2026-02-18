@@ -24,9 +24,10 @@ from strategies.realtime.data_source import (
 class CSVDataSource:
     """DataSource backed by a CSV file of 1-min bars."""
 
-    def __init__(self, csv_path: str):
+    def __init__(self, csv_path: str, upsample: bool = False):
         self._df = self._load_csv(csv_path)
         self._la = zoneinfo.ZoneInfo("America/Los_Angeles")
+        self._upsample = upsample
 
     # ------------------------------------------------------------------
     # CSV loading
@@ -60,12 +61,12 @@ class CSVDataSource:
     def fetch_range(self, start_ts: int, end_ts: int) -> pd.DataFrame:
         """Return synthetic ticks for bars within [start_ts, end_ts]."""
         mask = (self._df['timestamp'] >= start_ts) & (self._df['timestamp'] <= end_ts)
-        return self._bars_to_ticks(self._df.loc[mask])
+        return self._bars_to_ticks(self._df.loc[mask], upsample=self._upsample)
 
     def fetch_since(self, since_ts: int, end_ts: int) -> pd.DataFrame:
         """Return synthetic ticks for bars within (since_ts, end_ts]."""
         mask = (self._df['timestamp'] > since_ts) & (self._df['timestamp'] <= end_ts)
-        return self._bars_to_ticks(self._df.loc[mask])
+        return self._bars_to_ticks(self._df.loc[mask], upsample=self._upsample)
 
     def fetch_prev_day(self, now_ts: int) -> pd.DataFrame:
         """Return synthetic ticks for the previous trading day."""
@@ -118,16 +119,63 @@ class CSVDataSource:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _bars_to_ticks(bars: pd.DataFrame) -> pd.DataFrame:
+    def _bars_to_ticks(bars: pd.DataFrame, upsample: bool = False) -> pd.DataFrame:
         """Convert 1-min bars to synthetic tick format for BarAggregator."""
         if bars.empty:
             return pd.DataFrame(columns=['timestamp', 'price', 'volume', 'buys', 'sells'])
 
-        ticks = pd.DataFrame({
-            'timestamp': bars['timestamp'].values,
-            'price': bars['close'].values,
-            'volume': bars['volume'].values,
-            'buys': bars.get('bidvolume', bars.get('buys', pd.Series(0, index=bars.index))).values,
-            'sells': bars.get('askvolume', bars.get('sells', pd.Series(0, index=bars.index))).values,
+        if not upsample:
+            ticks = pd.DataFrame({
+                'timestamp': bars['timestamp'].values,
+                'price': bars['close'].values,
+                'volume': bars['volume'].values,
+                'buys': bars.get('bidvolume', bars.get('buys', pd.Series(0, index=bars.index))).values,
+                'sells': bars.get('askvolume', bars.get('sells', pd.Series(0, index=bars.index))).values,
+            })
+            return ticks.reset_index(drop=True)
+
+        # Upsample: 4 ticks per bar (O, H, L, C) at :00, :15, :30, :45
+        timestamps = bars['timestamp'].values
+        opens = bars['open'].values
+        highs = bars['high'].values
+        lows = bars['low'].values
+        closes = bars['close'].values
+        volumes = bars['volume'].values
+        buys_col = bars.get('bidvolume', bars.get('buys', pd.Series(0, index=bars.index))).values
+        sells_col = bars.get('askvolume', bars.get('sells', pd.Series(0, index=bars.index))).values
+
+        n = len(bars)
+        tick_ts = np.empty(n * 4, dtype=np.int64)
+        tick_price = np.empty(n * 4, dtype=np.float64)
+        tick_vol = np.empty(n * 4, dtype=np.float64)
+        tick_buys = np.empty(n * 4, dtype=np.float64)
+        tick_sells = np.empty(n * 4, dtype=np.float64)
+
+        vol_quarter = volumes / 4.0
+        buys_quarter = buys_col / 4.0
+        sells_quarter = sells_col / 4.0
+
+        for i in range(n):
+            base = i * 4
+            ts = timestamps[i]
+            tick_ts[base] = ts
+            tick_ts[base + 1] = ts + 15
+            tick_ts[base + 2] = ts + 30
+            tick_ts[base + 3] = ts + 45
+
+            tick_price[base] = opens[i]
+            tick_price[base + 1] = highs[i]
+            tick_price[base + 2] = lows[i]
+            tick_price[base + 3] = closes[i]
+
+            tick_vol[base:base + 4] = vol_quarter[i]
+            tick_buys[base:base + 4] = buys_quarter[i]
+            tick_sells[base:base + 4] = sells_quarter[i]
+
+        return pd.DataFrame({
+            'timestamp': tick_ts,
+            'price': tick_price,
+            'volume': tick_vol,
+            'buys': tick_buys,
+            'sells': tick_sells,
         })
-        return ticks.reset_index(drop=True)
