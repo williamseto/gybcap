@@ -126,3 +126,7 @@ vp/*_artifacts*/
 
 # Scratch files
 scratch.py
+
+# Dashboard cache (daily parquets + state snapshot)
+dashboard/cache/*.parquet
+dashboard/cache/*.json

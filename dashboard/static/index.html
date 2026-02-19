@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ES Swing Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+  <!-- Plotly.js from CDN — no build step required -->
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div id="loading">Loading dashboard…</div>
+
+<div id="app">
+
+  <!-- ── Header ────────────────────────────────────────────────────── -->
+  <header>
+    <div>
+      <span class="header-title">ES Swing Strategy Dashboard</span>
+    </div>
+    <div class="header-meta">
+      <span id="ws-status" class="disconnected" title="WebSocket status"></span>
+      <span id="header-date">—</span>
+    </div>
+  </header>
+
+  <!-- ── Left sidebar ───────────────────────────────────────────────── -->
+  <aside id="sidebar">
+
+    <!-- Regime badge -->
+    <div class="card">
+      <div class="card-title">Today's Regime</div>
+      <div id="regime-badge"></div>
+    </div>
+
+    <!-- Risk score gauge -->
+    <div class="card">
+      <div class="card-title">Composite Risk Score</div>
+      <div id="gauge-container"></div>
+    </div>
+
+    <!-- Component breakdown -->
+    <div class="card">
+      <div class="card-title">Risk Components</div>
+      <div id="component-bars"></div>
+    </div>
+
+    <!-- Probability bar -->
+    <div class="card">
+      <div class="card-title">Regime Probabilities</div>
+      <div id="proba-bar">
+        <div id="proba-bear"  style="width:33%"></div>
+        <div id="proba-bal"   style="width:34%"></div>
+        <div id="proba-bull"  style="width:33%"></div>
+      </div>
+      <div class="proba-labels">
+        <span id="proba-label-bear">BEAR —%</span>
+        <span id="proba-label-bal">BAL —%</span>
+        <span id="proba-label-bull">BULL —%</span>
+      </div>
+    </div>
+
+    <!-- HMM state -->
+    <div class="card">
+      <div class="card-title">HMM State</div>
+      <div id="hmm-row"></div>
+    </div>
+
+  </aside>
+
+  <!-- ── Right charts column ─────────────────────────────────────────── -->
+  <main id="charts">
+
+    <!-- 1. ES Candlestick + regime bands -->
+    <div class="card">
+      <div id="chart-candle" class="chart-container tall"></div>
+    </div>
+
+    <!-- 2. Risk score history -->
+    <div class="card">
+      <div id="chart-risk" class="chart-container"></div>
+    </div>
+
+    <!-- 3a. ES–NQ correlation -->
+    <div class="card">
+      <div id="chart-corr-nq" style="height:200px"></div>
+    </div>
+
+    <!-- 3b. ES–ZN correlation -->
+    <div class="card">
+      <div id="chart-corr-zn" style="height:200px"></div>
+    </div>
+
+    <!-- 4. Change detection -->
+    <div class="card">
+      <div id="chart-change" style="height:200px"></div>
+    </div>
+
+    <!-- 5. OOS probabilities -->
+    <div class="card">
+      <div id="chart-oos" class="chart-container"></div>
+    </div>
+
+  </main>
+
+  <!-- ── Bottom: live signals ────────────────────────────────────────── -->
+  <section id="signals-panel" class="card">
+    <div class="card-title">Live Intraday Signals</div>
+    <div id="signals-placeholder">Realtime engine not connected — no signals yet</div>
+    <div id="signals-table-wrap">
+      <table id="signals-table" style="display:none">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Strategy</th>
+            <th>Direction</th>
+            <th>Level</th>
+            <th>Entry Price</th>
+            <th>Confidence</th>
+          </tr>
+        </thead>
+        <tbody id="signals-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+</div><!-- /#app -->
+
+<script src="/app.js"></script>
+</body>
+</html>
