@@ -94,7 +94,8 @@ class DailyDataFetcher:
         if yf_df is not None and len(yf_df) > 0:
             if cached is not None:
                 combined = pd.concat([cached, yf_df])
-                combined = combined[~combined.index.duplicated(keep="first")]
+                # Keep yfinance rows on overlap so corrected bars replace stale cache rows.
+                combined = combined[~combined.index.duplicated(keep="last")]
                 combined = combined.sort_index()
             else:
                 combined = yf_df
@@ -158,24 +159,11 @@ class DailyDataFetcher:
         start: Optional[date],
     ) -> Optional[pd.DataFrame]:
         """Fetch daily OHLCV from yfinance, return normalized DataFrame."""
-        import yfinance as yf
-
         yf_sym = YF_SYMBOLS.get(symbol, symbol)
         start_str = start.isoformat() if start else "2005-01-01"
         logger.info("Fetching %s (%s) from yfinance since %s...", symbol, yf_sym, start_str)
 
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                raw = yf.download(
-                    yf_sym,
-                    start=start_str,
-                    progress=False,
-                    auto_adjust=True,
-                )
-        except Exception as e:
-            logger.error("yfinance download failed for %s: %s", yf_sym, e)
-            return None
+        raw = self._download_yfinance(yf_sym, start_str)
 
         if raw is None or len(raw) == 0:
             logger.warning("yfinance returned empty data for %s", yf_sym)
@@ -210,9 +198,10 @@ class DailyDataFetcher:
         today: date,
     ) -> None:
         """Fetch today's bar for yf_sym and append to csv_path if needed."""
-        import yfinance as yf
+        existing = None
+        fetch_start: Optional[date] = None
 
-        # Check if the CSV already has today
+        # Check whether CSV is current; otherwise fetch from the first missing date.
         if csv_path.exists():
             existing = self._read_external_csv(csv_path)
             if existing is not None and len(existing) > 0:
@@ -221,16 +210,14 @@ class DailyDataFetcher:
                     last = last.date()
                 if last >= today:
                     return  # already current
+                fetch_start = last + timedelta(days=1)
+            else:
+                logger.warning("Could not parse existing %s; rebuilding from yfinance", csv_path.name)
+                fetch_start = None
 
-        # Fetch last 5 days to be safe (handles weekends/holidays)
-        start_str = (today - timedelta(days=7)).isoformat()
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                raw = yf.download(yf_sym, start=start_str, progress=False, auto_adjust=True)
-        except Exception as e:
-            logger.warning("yfinance fetch for %s failed: %s", yf_sym, e)
-            return
+        start_str = fetch_start.isoformat() if fetch_start else "2005-01-01"
+        logger.info("Top-up %s from yfinance since %s", csv_path.name, start_str)
+        raw = self._download_yfinance(yf_sym, start_str)
 
         if raw is None or len(raw) == 0:
             return
@@ -286,16 +273,37 @@ class DailyDataFetcher:
         try:
             df = pd.read_csv(path)
             df.columns = [c.strip() for c in df.columns]
-            # Try DATE column (VIX format) first
-            date_col = next(
-                (c for c in df.columns if c.upper() == "DATE"),
-                None
-            )
+
+            date_col = next((c for c in df.columns if c.lower() == "date"), None)
             if date_col is None:
                 return None
-            df[date_col] = pd.to_datetime(df[date_col], dayfirst=False)
-            df = df.set_index(date_col).sort_index()
+
+            df[date_col] = pd.to_datetime(df[date_col], dayfirst=False, errors="coerce")
+            df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
             df.columns = [c.lower() for c in df.columns]
+
+            for col in ["open", "high", "low", "close"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "close" in df.columns:
+                df = df.dropna(subset=["close"])
             return df
         except Exception:
+            return None
+
+    def _download_yfinance(self, yf_symbol: str, start_str: str) -> Optional[pd.DataFrame]:
+        """Thin wrapper around yfinance download to keep fetch logic testable."""
+        import yfinance as yf
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return yf.download(
+                    yf_symbol,
+                    start=start_str,
+                    progress=False,
+                    auto_adjust=True,
+                )
+        except Exception as e:
+            logger.warning("yfinance download failed for %s: %s", yf_symbol, e)
             return None

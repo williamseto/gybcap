@@ -11,12 +11,12 @@ Bootstrap (first run, slow ~4-6 min):
   - Run 5-fold walk-forward XGB → oos_cache
   - Run 5-fold walk-forward Isolation Forest → anomaly_cache
 
-Daily refresh (fast ~15-25s):
+Daily refresh (fast if no gaps; scales with missing days):
   1. Fetch new daily bar (yfinance top-up, ~5s)
   2. Compute features vectorially (~2s)
-  3. Check caches — if today already present, skip retraining
-  4. Fit final XGB on all-but-today → predict today → append to oos_cache
-  5. Fit IF on all-but-today → score today → append to anomaly_cache
+  3. Check caches and fill any missing dates since last refresh
+  4. For each missing date, fit XGB on prior data only → append OOS row
+  5. For each missing date, fit IF on prior data only → append anomaly row
   6. Compute change/risk vectorially on full history (~0.5s)
   7. Assemble DashboardState using full ES history (not OOS-only)
 
@@ -58,6 +58,9 @@ class DashboardRunnerConfig:
     chart_history_days: int = 252
     refresh_secret: str = "changeme"
     hmm_n_states: int = 3
+    # False: fast single-train backlog catchup (production)
+    # True: strict per-missing-day causal backfill (research)
+    strict_backfill: bool = False
 
 
 class SwingDashboardRunner:
@@ -109,37 +112,53 @@ class SwingDashboardRunner:
     # ------------------------------------------------------------------ #
 
     def _run_pipeline(self) -> DashboardState:
+        t0 = time.perf_counter()
+
         # ── 1. Fetch daily data ─────────────────────────────────────────
+        t_fetch = time.perf_counter()
         logger.info("Fetching daily data...")
         self._fetcher.topup_external_csvs()
         es_daily = self._fetcher.fetch_and_update("ES")
         nq_daily = self._fetcher.fetch_and_update("NQ")
         zn_daily = self._fetcher.fetch_and_update("ZN")
+        logger.info("Stage timing: data fetch %.2fs", time.perf_counter() - t_fetch)
 
         # ── 2. Compute features (vectorized, ~2s) ───────────────────────
+        t_features = time.perf_counter()
         logger.info("Computing features (%d ES days)...", len(es_daily))
         features, feature_cols = self._compute_features(es_daily, nq_daily, zn_daily)
         labels_df = self._compute_labels(es_daily)
         df = features.join(labels_df).dropna(subset=["y_structural"])
+        logger.info("Stage timing: features+labels %.2fs", time.perf_counter() - t_features)
 
         # ── 3. Bootstrap caches if missing (slow, one-time) ────────────
+        t_bootstrap = time.perf_counter()
         self._ensure_historical_caches(df, feature_cols, es_daily)
+        logger.info("Stage timing: cache bootstrap/check %.2fs", time.perf_counter() - t_bootstrap)
 
-        # ── 4. Incremental update for today (~15-25s) ───────────────────
-        today_proba, top_features = self._update_today(df, feature_cols, es_daily)
+        # ── 4. Incremental cache update (fills any missing days causally) ─
+        t_update = time.perf_counter()
+        today_proba, top_features = self._update_prediction_caches(df, feature_cols, es_daily)
+        logger.info("Stage timing: prediction cache update %.2fs", time.perf_counter() - t_update)
 
         # ── 5. Load caches + compute change/risk on full history ────────
+        t_risk = time.perf_counter()
         anomaly_cache = pd.read_parquet(ANOMALY_CACHE)
         oos_cache     = pd.read_parquet(OOS_CACHE)
         change_df, risk_df = self._compute_change_risk(es_daily, df, feature_cols, anomaly_cache)
+        logger.info("Stage timing: change+risk %.2fs", time.perf_counter() - t_risk)
 
         # ── 6. Assemble state ───────────────────────────────────────────
+        t_state = time.perf_counter()
         logger.info("Assembling state...")
-        return self._build_state(
+        state = self._build_state(
             es_daily, nq_daily, zn_daily,
             anomaly_cache, change_df, risk_df, oos_cache,
             today_proba, top_features,
         )
+        logger.info("Stage timing: state assembly %.2fs", time.perf_counter() - t_state)
+        logger.info("Stage timing: pipeline total %.2fs", time.perf_counter() - t0)
+        return state
 
     # ------------------------------------------------------------------ #
     # Feature computation
@@ -221,7 +240,7 @@ class SwingDashboardRunner:
             return
 
         cfg = self._config
-        # df_train excludes today (last row has y=-1)
+        # Build historical caches on all rows except the latest prediction row.
         df_train = df.iloc[:-1]
         valid_mask = df_train["y_structural"].isin([0, 1, 2])
         df_valid = df_train[valid_mask]
@@ -318,57 +337,259 @@ class SwingDashboardRunner:
     # Incremental daily update (~15-25s)
     # ------------------------------------------------------------------ #
 
-    def _update_today(
+    def _update_prediction_caches(
         self,
         df: pd.DataFrame,
         feature_cols: list[str],
         es_daily: pd.DataFrame,
     ) -> tuple[list[float], list[tuple[str, float]]]:
-        """Fit final XGB + IF on all-but-today, score today, append to caches."""
-        today = df.index[-1]
+        """Fill missing OOS/anomaly cache rows causally and return latest prediction."""
+        valid_mask = df["y_structural"].isin([0, 1, 2])
+        df_valid = df[valid_mask].copy()
+        if df_valid.empty:
+            return [0.33, 0.34, 0.33], []
 
-        # ── OOS cache: append today's prediction if not already there ───
-        oos_cache = pd.read_parquet(OOS_CACHE) if OOS_CACHE.exists() else pd.DataFrame()
-        if not oos_cache.empty and today in oos_cache.index:
-            today_proba = [
-                float(oos_cache.at[today, "p_bear"]),
-                float(oos_cache.at[today, "p_bal"]),
-                float(oos_cache.at[today, "p_bull"]),
-            ]
-            top_features: list[tuple[str, float]] = []
-            logger.info("Today's prediction already cached, skipping XGB refit")
-        else:
-            logger.info("Fitting final XGB on all-but-today...")
-            today_proba, top_features = self._fit_final_xgb(df, feature_cols, es_daily)
-            # Append to OOS cache
-            pred = int(np.argmax(today_proba))
-            new_row = pd.DataFrame({
-                "pred":   [pred],
-                "actual": [-1],   # unknown until tomorrow
-                "p_bear": [today_proba[0]],
-                "p_bal":  [today_proba[1]],
-                "p_bull": [today_proba[2]],
-            }, index=pd.DatetimeIndex([today]))
-            new_row.index.name = "date"
-            updated = pd.concat([oos_cache, new_row])
+        all_dates = list(df_valid.index)
+        latest_date = all_dates[-1]
+        top_features: list[tuple[str, float]] = []
+
+        oos_cache = (
+            pd.read_parquet(OOS_CACHE)
+            if OOS_CACHE.exists()
+            else pd.DataFrame(columns=["pred", "actual", "p_bear", "p_bal", "p_bull"])
+        )
+        anomaly_cache = (
+            pd.read_parquet(ANOMALY_CACHE)
+            if ANOMALY_CACHE.exists()
+            else pd.DataFrame(columns=["anomaly_score"])
+        )
+        if not oos_cache.empty:
+            oos_cache.index = pd.to_datetime(oos_cache.index)
+            oos_cache = oos_cache.sort_index()
+        if not anomaly_cache.empty:
+            anomaly_cache.index = pd.to_datetime(anomaly_cache.index)
+            anomaly_cache = anomaly_cache.sort_index()
+
+        # Fill stale placeholder actuals once labels become available.
+        oos_cache_before = oos_cache.copy()
+        oos_cache = self._backfill_oos_actuals(oos_cache, df_valid)
+        oos_backfill_changed = not oos_cache.equals(oos_cache_before)
+
+        oos_missing = self._find_missing_dates(all_dates, oos_cache)
+        if oos_missing:
+            logger.info(
+                "Backfilling OOS cache for %d missing day(s): %s -> %s",
+                len(oos_missing),
+                oos_missing[0].date() if hasattr(oos_missing[0], "date") else oos_missing[0],
+                oos_missing[-1].date() if hasattr(oos_missing[-1], "date") else oos_missing[-1],
+            )
+            if self._config.strict_backfill:
+                new_rows = []
+                for d in oos_missing:
+                    pred_idx = int(df_valid.index.get_loc(d))
+                    proba, feat_imp = self._fit_xgb_for_index(
+                        df_valid, feature_cols, es_daily, pred_idx, pred_date=d
+                    )
+                    pred = int(np.argmax(proba))
+                    actual = -1 if d == latest_date else int(df_valid.at[d, "y_structural"])
+                    new_rows.append({
+                        "date": d,
+                        "pred": pred,
+                        "actual": actual,
+                        "p_bear": float(proba[0]),
+                        "p_bal": float(proba[1]),
+                        "p_bull": float(proba[2]),
+                    })
+                    if d == latest_date:
+                        top_features = feat_imp
+            else:
+                logger.info("Production mode: single-train OOS backfill for %d day(s)", len(oos_missing))
+                proba_map, top_features = self._predict_missing_oos_fast(
+                    df_valid, feature_cols, es_daily, oos_missing
+                )
+                new_rows = []
+                for d in oos_missing:
+                    proba = proba_map.get(d, [0.33, 0.34, 0.33])
+                    pred = int(np.argmax(proba))
+                    actual = -1 if d == latest_date else int(df_valid.at[d, "y_structural"])
+                    new_rows.append({
+                        "date": d,
+                        "pred": pred,
+                        "actual": actual,
+                        "p_bear": float(proba[0]),
+                        "p_bal": float(proba[1]),
+                        "p_bull": float(proba[2]),
+                    })
+
+            new_df = pd.DataFrame(new_rows).set_index("date")
+            updated = pd.concat([oos_cache, new_df])
             updated = updated[~updated.index.duplicated(keep="last")].sort_index()
             updated.to_parquet(OOS_CACHE)
+            oos_cache = updated
+        elif oos_backfill_changed:
+            oos_cache.to_parquet(OOS_CACHE)
 
-        # ── Anomaly cache: append today's score if not already there ────
-        anomaly_cache = pd.read_parquet(ANOMALY_CACHE) if ANOMALY_CACHE.exists() else pd.DataFrame()
-        if not anomaly_cache.empty and today in anomaly_cache.index:
-            logger.info("Today's anomaly score already cached, skipping IF refit")
-        else:
-            logger.info("Fitting IF on all-but-today for today's anomaly score...")
-            today_score = self._score_today_anomaly(df, feature_cols)
-            new_row = pd.DataFrame({"anomaly_score": [today_score]},
-                                   index=pd.DatetimeIndex([today]))
-            new_row.index.name = "date"
-            updated = pd.concat([anomaly_cache, new_row])
+        anomaly_missing = self._find_missing_dates(all_dates, anomaly_cache)
+        if anomaly_missing:
+            logger.info(
+                "Backfilling anomaly cache for %d missing day(s): %s -> %s",
+                len(anomaly_missing),
+                anomaly_missing[0].date() if hasattr(anomaly_missing[0], "date") else anomaly_missing[0],
+                anomaly_missing[-1].date() if hasattr(anomaly_missing[-1], "date") else anomaly_missing[-1],
+            )
+            if self._config.strict_backfill:
+                new_rows = []
+                for d in anomaly_missing:
+                    pred_idx = int(df_valid.index.get_loc(d))
+                    score = self._score_anomaly_for_index(df_valid, feature_cols, pred_idx)
+                    new_rows.append({"date": d, "anomaly_score": score})
+            else:
+                logger.info("Production mode: single-fit anomaly backfill for %d day(s)", len(anomaly_missing))
+                score_map = self._score_missing_anomaly_fast(df_valid, feature_cols, anomaly_missing)
+                new_rows = [{"date": d, "anomaly_score": float(score_map.get(d, 0.0))} for d in anomaly_missing]
+
+            new_df = pd.DataFrame(new_rows).set_index("date")
+            updated = pd.concat([anomaly_cache, new_df])
             updated = updated[~updated.index.duplicated(keep="last")].sort_index()
             updated.to_parquet(ANOMALY_CACHE)
+            anomaly_cache = updated
+
+        if not oos_cache.empty and latest_date in oos_cache.index:
+            today_row = oos_cache.loc[latest_date]
+            today_proba = [
+                float(today_row["p_bear"]),
+                float(today_row["p_bal"]),
+                float(today_row["p_bull"]),
+            ]
+        else:
+            logger.warning("Latest date %s missing from OOS cache; using neutral probabilities", latest_date)
+            today_proba = [0.33, 0.34, 0.33]
 
         return today_proba, top_features
+
+    def _find_missing_dates(self, all_dates: list, cache_df: pd.DataFrame) -> list:
+        """Return prediction-eligible dates that are absent in cache index."""
+        if not all_dates:
+            return []
+
+        # Caches intentionally do not cover warmup history before min_train_days.
+        start_idx = min(max(self._config.min_train_days, 0), len(all_dates) - 1)
+        candidate_dates = all_dates[start_idx:]
+        if not candidate_dates:
+            return []
+
+        if cache_df.empty:
+            return [candidate_dates[-1]]
+        cached = set(pd.to_datetime(cache_df.index))
+        return [d for d in candidate_dates if d not in cached]
+
+    def _backfill_oos_actuals(self, oos_cache: pd.DataFrame, df_valid: pd.DataFrame) -> pd.DataFrame:
+        """Update prior cache rows with actual labels once they are no longer the latest day."""
+        if oos_cache.empty or "actual" not in oos_cache.columns:
+            return oos_cache
+
+        latest_date = df_valid.index[-1]
+        labels = df_valid["y_structural"].astype(int)
+        pending_idx = [
+            d for d in oos_cache[oos_cache["actual"].eq(-1)].index.unique()
+            if d < latest_date
+        ]
+        if not pending_idx:
+            return oos_cache
+
+        updated = oos_cache.copy()
+        n = 0
+        for d in pending_idx:
+            if d in labels.index:
+                updated.at[d, "actual"] = int(labels.at[d])
+                n += 1
+
+        if n > 0:
+            logger.info("Backfilled actual labels for %d prior OOS day(s)", n)
+        return updated
+
+    def _predict_missing_oos_fast(
+        self,
+        df_valid: pd.DataFrame,
+        feature_cols: list[str],
+        es_daily: pd.DataFrame,
+        missing_dates: list,
+    ) -> tuple[dict, list[tuple[str, float]]]:
+        """Fast backlog fill: one model fit, predict all missing dates (hindsight-biased)."""
+        from strategies.swing.training.regime_trainer import DEFAULT_PARAMS
+        from strategies.swing.labeling.hmm_regime import compute_hmm_features_walkforward
+        from xgboost import XGBClassifier
+
+        if not missing_dates:
+            return {}, []
+
+        latest_idx = len(df_valid) - 1
+        if latest_idx < self._config.min_train_days:
+            neutral = {d: [0.33, 0.34, 0.33] for d in missing_dates}
+            return neutral, []
+
+        df_aug = df_valid.copy()
+        try:
+            hmm_train_end = int(es_daily.index.get_loc(df_valid.index[-1]))
+        except Exception:
+            hmm_train_end = latest_idx
+        hmm_feats = compute_hmm_features_walkforward(
+            es_daily, hmm_train_end, n_states=self._config.hmm_n_states
+        )
+        hmm_cols = [c for c in hmm_feats.columns if c not in df_aug.columns]
+        for c in hmm_cols:
+            df_aug[c] = hmm_feats[c].reindex(df_aug.index).fillna(0)
+
+        all_feat_cols = [c for c in feature_cols if c in df_aug.columns] + hmm_cols
+        X = df_aug[all_feat_cols].fillna(0).values
+        y = df_aug["y_structural"].values.astype(int)
+        X_train, y_train = X[:-1], y[:-1]
+        if len(X_train) == 0:
+            neutral = {d: [0.33, 0.34, 0.33] for d in missing_dates}
+            return neutral, []
+
+        missing_classes = set([0, 1, 2]) - set(np.unique(y_train))
+        if missing_classes:
+            for cls in missing_classes:
+                X_train = np.vstack([X_train, np.zeros((1, X_train.shape[1]))])
+                y_train = np.append(y_train, cls)
+
+        class_counts = np.maximum(np.bincount(y_train, minlength=3).astype(float), 1.0)
+        class_weights = len(y_train) / (3.0 * class_counts)
+        class_weights[0] *= 1.5
+        sample_weights = class_weights[y_train]
+
+        params = {k: v for k, v in DEFAULT_PARAMS.items() if k != "bear_upweight"}
+        model = XGBClassifier(**params)
+        model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
+
+        pred_idx = [int(df_valid.index.get_loc(d)) for d in missing_dates]
+        probas = model.predict_proba(X[pred_idx])
+        proba_map = {d: probas[i].tolist() for i, d in enumerate(missing_dates)}
+
+        top_idx = np.argsort(model.feature_importances_)[::-1][:10]
+        top_features = [(all_feat_cols[i], float(model.feature_importances_[i])) for i in top_idx]
+        return proba_map, top_features
+
+    def _score_missing_anomaly_fast(
+        self,
+        df_valid: pd.DataFrame,
+        feature_cols: list[str],
+        missing_dates: list,
+    ) -> dict:
+        """Fast backlog fill: one IF fit, score all missing dates (hindsight-biased)."""
+        from strategies.swing.detection.anomaly_detector import RollingAnomalyDetector
+
+        if not missing_dates:
+            return {}
+
+        feature_matrix = df_valid[[c for c in feature_cols if c in df_valid.columns]].fillna(0)
+        if len(feature_matrix) < 2:
+            return {d: 0.0 for d in missing_dates}
+
+        detector = RollingAnomalyDetector(n_estimators=200)
+        result = detector.fit_score(feature_matrix, train_end_idx=len(feature_matrix) - 1)
+        return {d: float(result.at[d, "anomaly_score"]) if d in result.index else 0.0 for d in missing_dates}
 
     def _fit_final_xgb(
         self,
@@ -376,30 +597,63 @@ class SwingDashboardRunner:
         feature_cols: list[str],
         es_daily: pd.DataFrame,
     ) -> tuple[list[float], list[tuple[str, float]]]:
+        """Backward-compatible wrapper for scoring the latest valid row."""
+        valid_mask = df["y_structural"].isin([0, 1, 2])
+        df_valid = df[valid_mask].copy()
+        if df_valid.empty:
+            return [0.33, 0.34, 0.33], []
+        pred_idx = len(df_valid) - 1
+        return self._fit_xgb_for_index(df_valid, feature_cols, es_daily, pred_idx)
+
+    def _fit_xgb_for_index(
+        self,
+        df_valid: pd.DataFrame,
+        feature_cols: list[str],
+        es_daily: pd.DataFrame,
+        pred_idx: int,
+        pred_date=None,
+    ) -> tuple[list[float], list[tuple[str, float]]]:
         from strategies.swing.training.regime_trainer import DEFAULT_PARAMS
         from strategies.swing.labeling.hmm_regime import compute_hmm_features_walkforward
         from xgboost import XGBClassifier
 
         cfg = self._config
-        valid_mask = df["y_structural"].isin([0, 1, 2])
-        df_valid = df[valid_mask].copy()
         n = len(df_valid)
+        if pred_idx < 0 or pred_idx >= n:
+            raise IndexError(f"pred_idx out of range: {pred_idx} (n={n})")
 
-        if n < cfg.min_train_days + 1:
+        # Need at least min_train_days before the prediction row.
+        if pred_idx < cfg.min_train_days:
             return [0.33, 0.34, 0.33], []
 
-        # HMM fitted on all-but-today
-        hmm_feats = compute_hmm_features_walkforward(es_daily, n - 1, n_states=cfg.hmm_n_states)
+        df_slice = df_valid.iloc[: pred_idx + 1].copy()
+
+        # HMM fitted on all rows before the prediction date.
+        hmm_train_end = pred_idx
+        if pred_date is not None:
+            try:
+                hmm_train_end = int(es_daily.index.get_loc(pred_date))
+            except Exception:
+                hmm_train_end = pred_idx
+        hmm_feats = compute_hmm_features_walkforward(es_daily, hmm_train_end, n_states=cfg.hmm_n_states)
         hmm_cols = [c for c in hmm_feats.columns if c not in df_valid.columns]
         for c in hmm_cols:
-            df_valid[c] = hmm_feats[c].reindex(df_valid.index).fillna(0)
+            df_slice[c] = hmm_feats[c].reindex(df_slice.index).fillna(0)
 
-        all_feat_cols = [c for c in feature_cols if c in df_valid.columns] + hmm_cols
-        X = df_valid[all_feat_cols].fillna(0).values
-        y = df_valid["y_structural"].values.astype(int)
+        all_feat_cols = [c for c in feature_cols if c in df_slice.columns] + hmm_cols
+        X = df_slice[all_feat_cols].fillna(0).values
+        y = df_slice["y_structural"].values.astype(int)
 
         X_train, y_train = X[:-1], y[:-1]
         X_today = X[-1:]
+        if len(X_train) == 0:
+            return [0.33, 0.34, 0.33], []
+
+        missing = set([0, 1, 2]) - set(np.unique(y_train))
+        if missing:
+            for cls in missing:
+                X_train = np.vstack([X_train, np.zeros((1, X_train.shape[1]))])
+                y_train = np.append(y_train, cls)
 
         class_counts = np.maximum(np.bincount(y_train, minlength=3).astype(float), 1.0)
         class_weights = len(y_train) / (3.0 * class_counts)
@@ -416,15 +670,28 @@ class SwingDashboardRunner:
         return proba, top_features
 
     def _score_today_anomaly(self, df: pd.DataFrame, feature_cols: list[str]) -> float:
+        """Backward-compatible wrapper for scoring anomaly on latest valid row."""
+        valid_mask = df["y_structural"].isin([0, 1, 2])
+        df_valid = df[valid_mask].copy()
+        if df_valid.empty:
+            return 0.0
+        return self._score_anomaly_for_index(df_valid, feature_cols, len(df_valid) - 1)
+
+    def _score_anomaly_for_index(
+        self,
+        df_valid: pd.DataFrame,
+        feature_cols: list[str],
+        pred_idx: int,
+    ) -> float:
         from strategies.swing.detection.anomaly_detector import RollingAnomalyDetector
 
-        valid_mask = df["y_structural"].isin([0, 1, 2])
-        df_valid = df[valid_mask]
         feature_matrix = df_valid[[c for c in feature_cols if c in df_valid.columns]].fillna(0)
-        n = len(feature_matrix)
+        feature_slice = feature_matrix.iloc[: pred_idx + 1]
+        if len(feature_slice) < 2:
+            return 0.0
 
         detector = RollingAnomalyDetector(n_estimators=200)
-        result = detector.fit_score(feature_matrix, train_end_idx=n - 1)
+        result = detector.fit_score(feature_slice, train_end_idx=len(feature_slice) - 1)
         return float(result["anomaly_score"].iloc[-1])
 
     # ------------------------------------------------------------------ #

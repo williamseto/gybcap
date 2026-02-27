@@ -7,6 +7,7 @@ Usage:
 Environment variables:
     DASHBOARD_DATA_MODE   csv_plus_yfinance (default) | yfinance_only
     DASHBOARD_REFRESH_SECRET  secret for POST /api/refresh (default: changeme)
+    DASHBOARD_STRICT_BACKFILL  optional bool override (true/false)
     DASHBOARD_PORT        port (default: 8000)
     DASHBOARD_HOST        host (default: 0.0.0.0)
 """
@@ -36,6 +37,22 @@ PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
 HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
 
 
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if v in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("Invalid %s=%r (expected true/false). Using default=%s.", name, raw, default)
+    return default
+
+
+STRICT_BACKFILL = _parse_bool_env("DASHBOARD_STRICT_BACKFILL", default=False)
+
+
 async def main():
     from dashboard.runner import SwingDashboardRunner, DashboardRunnerConfig
     from dashboard.app import create_app, _background_refresh
@@ -45,6 +62,7 @@ async def main():
     config = DashboardRunnerConfig(
         data_mode=DATA_MODE,
         refresh_secret=REFRESH_SECRET,
+        strict_backfill=STRICT_BACKFILL,
     )
     runner = SwingDashboardRunner(config)
 

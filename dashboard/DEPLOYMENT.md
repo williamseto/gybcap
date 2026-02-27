@@ -72,6 +72,7 @@ curl -X POST http://localhost:8000/api/refresh \
 |----------|---------|-------------|
 | `DASHBOARD_DATA_MODE` | `csv_plus_yfinance` | `yfinance_only` for cloud |
 | `DASHBOARD_REFRESH_SECRET` | `changeme` | Protect POST /api/refresh |
+| `DASHBOARD_STRICT_BACKFILL` | `false` | `false` = fast single-train backlog; `true` = strict per-day causal backfill |
 | `DASHBOARD_PORT` | `8000` | Server port |
 | `DASHBOARD_HOST` | `0.0.0.0` | Bind address |
 
