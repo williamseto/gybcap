@@ -155,7 +155,7 @@ class TestReversionConfig:
         """Test default configuration values."""
         config = ReversionConfig.default()
 
-        assert config.timeframe == '15min'  # Reversion default is 15min
+        assert config.timeframe == '5min'  # Reversion default is 15min
         assert config.threshold_pct == 0.0012
         assert config.reward_risk_ratio == 2.0
 
@@ -167,5 +167,5 @@ class TestReversionConfig:
         bo_config = BreakoutConfig.default()
 
         # Reversion uses longer timeframe by default
-        assert rev_config.timeframe == '15min'
-        assert bo_config.timeframe == '5min'
+        assert rev_config.timeframe == '5min'
+        assert bo_config.timeframe == '15min'

@@ -54,6 +54,14 @@ class ReversalPredictorSlotConfig:
 
 
 @dataclass
+class RangePredictorSlotConfig:
+    """Configuration for the range predictor integration."""
+    model_dir: str = 'models/range_predictor'
+    predictions_csv: str = 'data/range_predictions.csv'
+    enabled: bool = True
+
+
+@dataclass
 class PlaybackConfig:
     """Configuration for CSV playback mode."""
     csv_path: str = ''
@@ -68,6 +76,7 @@ class EngineConfig:
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
     strategies: List[StrategySlotConfig] = field(default_factory=list)
     reversal_predictor: Optional[ReversalPredictorSlotConfig] = None
+    range_predictor: Optional[RangePredictorSlotConfig] = None
     update_interval_sec: float = 5.0
     gex_enabled: bool = True
     discord_enabled: bool = True
