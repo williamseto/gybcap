@@ -27,26 +27,13 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy.stats import spearmanr
 
-from strategies.swing.config import SwingConfig, INSTRUMENTS
+from strategies.swing.config import SwingConfig
 from strategies.swing.data_loader import load_instruments
 from strategies.swing.daily_aggregator import DailyAggregator, align_daily
-from strategies.swing.features.daily_technical import (
-    compute_daily_technical, FEATURE_NAMES as TECH_FEATURES,
-)
-from strategies.swing.features.volume_profile_daily import (
-    compute_vp_daily_features, FEATURE_NAMES as VP_FEATURES,
-)
-from strategies.swing.features.cross_instrument import (
-    compute_cross_features, get_feature_names as get_cross_names,
-)
-from strategies.swing.features.macro_context import (
-    compute_macro_context, FEATURE_NAMES as MACRO_FEATURES,
-)
-from strategies.swing.features.external_daily import compute_external_features
-from strategies.swing.labeling.structural_regime import compute_labels
 from strategies.swing.labeling.hmm_regime import (
-    compute_hmm_features_walkforward, FEATURE_NAMES as HMM_FEATURES,
+    compute_hmm_features_walkforward,
 )
+from strategies.swing.pipeline import build_training_frame
 from strategies.swing.training.regime_trainer import (
     walk_forward_cv, TrainerResult, FoldResult,
 )
@@ -105,59 +92,44 @@ def run_regime_pipeline(args) -> tuple[pd.DataFrame, dict, list[str]]:
     print(f"\n{'='*60}")
     print("STEP 3: Computing features")
     print("=" * 60)
+    print("  Building shared feature pipeline...")
+    other_dailys = [(sym, df) for sym, df in daily_data.items() if sym != "ES"] if len(daily_data) > 1 else None
+    artifacts = build_training_frame(
+        es_daily=es_daily,
+        other_dailys=None if args.es_only else other_dailys,
+        config=config,
+        include_vp=True,
+        include_external=not args.no_external,
+        include_range=True,
+        use_other_dailys_for_macro=True,
+    )
+    feature_cols = artifacts.feature_cols
+    labels = artifacts.labels
+    df = artifacts.df
+    feature_groups = artifacts.feature_groups
 
-    print("  Computing daily technical features...")
-    tech_feats = compute_daily_technical(es_daily)
-    feature_cols = list(TECH_FEATURES)
-
-    if "vp_poc_rel" in es_daily.columns:
-        print("  Computing VP daily features...")
-        vp_feats = compute_vp_daily_features(es_daily)
-        feature_cols += VP_FEATURES
+    print(f"    {len(feature_groups['technical'])} technical features")
+    if feature_groups["volume_profile"]:
+        print(f"    {len(feature_groups['volume_profile'])} VP features")
     else:
-        vp_feats = pd.DataFrame(index=es_daily.index)
-
-    if not args.es_only and len(daily_data) > 1:
-        print("  Computing cross-instrument features...")
-        other_dailys = [(sym, df) for sym, df in daily_data.items() if sym != "ES"]
-        cross_feats = compute_cross_features(es_daily, other_dailys, config.corr_windows)
-        cross_names = get_cross_names([sym for sym, _ in other_dailys])
-        cross_names = [c for c in cross_names if c in cross_feats.columns]
-        feature_cols += cross_names
+        print("  Skipping VP features")
+    if feature_groups["cross"]:
+        print(f"    {len(feature_groups['cross'])} cross-instrument features")
     else:
-        cross_feats = pd.DataFrame(index=es_daily.index)
-
-    print("  Computing macro context features...")
-    other_for_macro = [(sym, df) for sym, df in daily_data.items() if sym != "ES"] if len(daily_data) > 1 else None
-    macro_feats = compute_macro_context(es_daily, other_for_macro)
-    feature_cols += MACRO_FEATURES
-
-    # External features (VIX, DXY)
-    if not args.no_external:
-        print("  Computing external daily features (VIX, DXY)...")
-        ext_feats, ext_names = compute_external_features(es_daily)
-        feature_cols += ext_names
+        print("  Skipping cross-instrument features")
+    print(f"    {len(feature_groups['macro'])} macro context features")
+    if args.no_external:
+        print("  Skipping external features")
+    elif feature_groups["external"]:
+        print(f"    {len(feature_groups['external'])} external features")
     else:
-        ext_feats = pd.DataFrame(index=es_daily.index)
-
-    all_feats = pd.concat([tech_feats, vp_feats, cross_feats, macro_feats, ext_feats], axis=1)
-    all_feats = all_feats.reindex(es_daily.index).fillna(0)
+        print("  External features unavailable")
     print(f"\n  Total features: {len(feature_cols)}")
 
     # Compute labels
     print(f"\n{'='*60}")
     print("STEP 4: Computing regime labels")
     print("=" * 60)
-    labels = compute_labels(
-        es_daily,
-        swing_lookback=config.swing_lookback,
-        micro_threshold_pct=config.micro_threshold_pct,
-        detect_threshold=config.detect_threshold,
-        bull_threshold=config.bull_threshold,
-        bear_threshold=config.bear_threshold,
-    )
-    df = all_feats.join(labels)
-
     # Structural label diagnostics
     if "y_structural" in labels.columns:
         struct = labels["y_structural"]

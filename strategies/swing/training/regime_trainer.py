@@ -52,6 +52,7 @@ DEFAULT_PARAMS = {
     "eval_metric": "mlogloss",
     "learning_rate": 0.05,
     "n_estimators": 500,
+    "tree_method": "hist",
     "max_depth": 5,
     "min_child_weight": 10,
     "gamma": 0.5,

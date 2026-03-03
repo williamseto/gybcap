@@ -54,7 +54,11 @@ def compute_range_features(daily: pd.DataFrame) -> pd.DataFrame:
         # Range compression: current width vs longer-term average width
         # Use 3x timeframe for the baseline average
         baseline_window = min(tf_days * 3, len(close))
-        avg_width = (roll_range / close).rolling(baseline_window, min_periods=tf_days).mean()
+        baseline_min_periods = min(tf_days, baseline_window)
+        avg_width = (roll_range / close).rolling(
+            baseline_window,
+            min_periods=baseline_min_periods,
+        ).mean()
         current_width = roll_range / close
         out[f"range_compression_{tf_name}"] = current_width / avg_width.replace(0, np.nan)
 

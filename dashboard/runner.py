@@ -26,6 +26,7 @@ Causal discipline:
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ from sklearn.metrics import f1_score, accuracy_score
 
 from dashboard.state import DashboardState, DayState, make_empty_state
 from dashboard.data_fetcher import DailyDataFetcher
+from strategies.swing.config import SwingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -46,18 +48,20 @@ CACHE_DIR      = Path(__file__).resolve().parent / "cache"
 SNAPSHOT_PATH  = CACHE_DIR / "state_snapshot.json"
 OOS_CACHE      = CACHE_DIR / "oos_cache.parquet"      # date, pred, actual, p_bear, p_bal, p_bull
 ANOMALY_CACHE  = CACHE_DIR / "anomaly_cache.parquet"  # date, anomaly_score
+CACHE_META     = CACHE_DIR / "cache_contract.json"
 
 RISK_WEIGHTS = {"range": 0.15, "anomaly": 0.25, "change": 0.60}
+_SWING_DEFAULTS = SwingConfig()
 
 
 @dataclass
 class DashboardRunnerConfig:
     data_mode: str = "csv_plus_yfinance"  # or "yfinance_only"
-    n_folds: int = 5
-    min_train_days: int = 500
+    n_folds: int = _SWING_DEFAULTS.n_folds
+    min_train_days: int = _SWING_DEFAULTS.min_train_days
     chart_history_days: int = 252
     refresh_secret: str = "changeme"
-    hmm_n_states: int = 3
+    hmm_n_states: int = _SWING_DEFAULTS.hmm_n_states
     # False: fast single-train backlog catchup (production)
     # True: strict per-missing-day causal backfill (research)
     strict_backfill: bool = False
@@ -67,6 +71,11 @@ class SwingDashboardRunner:
 
     def __init__(self, config: DashboardRunnerConfig | None = None):
         self._config = config or DashboardRunnerConfig()
+        self._swing_config = SwingConfig(
+            n_folds=self._config.n_folds,
+            min_train_days=self._config.min_train_days,
+            hmm_n_states=self._config.hmm_n_states,
+        )
         self._fetcher = DailyDataFetcher(data_mode=self._config.data_mode)
         self._last_state: DashboardState | None = None
 
@@ -126,13 +135,14 @@ class SwingDashboardRunner:
         # ── 2. Compute features (vectorized, ~2s) ───────────────────────
         t_features = time.perf_counter()
         logger.info("Computing features (%d ES days)...", len(es_daily))
-        features, feature_cols = self._compute_features(es_daily, nq_daily, zn_daily)
-        labels_df = self._compute_labels(es_daily)
-        df = features.join(labels_df).dropna(subset=["y_structural"])
+        artifacts = self._build_training_frame(es_daily, nq_daily, zn_daily)
+        feature_cols = artifacts.feature_cols
+        df = artifacts.df.dropna(subset=["y_structural"])
         logger.info("Stage timing: features+labels %.2fs", time.perf_counter() - t_features)
 
         # ── 3. Bootstrap caches if missing (slow, one-time) ────────────
         t_bootstrap = time.perf_counter()
+        self._ensure_cache_contract(feature_cols)
         self._ensure_historical_caches(df, feature_cols, es_daily)
         logger.info("Stage timing: cache bootstrap/check %.2fs", time.perf_counter() - t_bootstrap)
 
@@ -170,61 +180,86 @@ class SwingDashboardRunner:
         nq_daily: pd.DataFrame,
         zn_daily: pd.DataFrame,
     ) -> tuple[pd.DataFrame, list[str]]:
-        from strategies.swing.features.daily_technical import (
-            compute_daily_technical, FEATURE_NAMES as TECH_FEATURES,
+        from strategies.swing.pipeline import compute_feature_frame
+
+        features, feature_cols, _ = compute_feature_frame(
+            es_daily=es_daily,
+            other_dailys=[("NQ", nq_daily), ("ZN", zn_daily)],
+            include_vp=True,
+            include_external=True,
+            include_range=True,
+            corr_windows=self._swing_config.corr_windows,
+            use_other_dailys_for_macro=True,
         )
-        from strategies.swing.features.volume_profile_daily import (
-            compute_vp_daily_features, FEATURE_NAMES as VP_FEATURES,
-        )
-        from strategies.swing.features.macro_context import (
-            compute_macro_context, FEATURE_NAMES as MACRO_FEATURES,
-        )
-        from strategies.swing.features.range_features import (
-            compute_range_features, FEATURE_NAMES as RANGE_FEATURES,
-        )
-        from strategies.swing.features.cross_instrument import compute_cross_features
-        from strategies.swing.features.external_daily import compute_external_features
-
-        feature_cols: list[str] = []
-
-        tech = compute_daily_technical(es_daily)
-        feature_cols += list(TECH_FEATURES)
-
-        vp = pd.DataFrame(index=es_daily.index)
-        if "vp_poc_rel" in es_daily.columns:
-            vp = compute_vp_daily_features(es_daily)
-            feature_cols += list(VP_FEATURES)
-
-        macro = compute_macro_context(es_daily, other_dailys=None)
-        feature_cols += list(MACRO_FEATURES)
-
-        range_feats = compute_range_features(es_daily)
-        feature_cols += list(RANGE_FEATURES)
-
-        nq_df = pd.DataFrame({"close": nq_daily["close"].reindex(es_daily.index, method="ffill")}, index=es_daily.index)
-        zn_df = pd.DataFrame({"close": zn_daily["close"].reindex(es_daily.index, method="ffill")}, index=es_daily.index)
-        cross = compute_cross_features(es_daily, [("NQ", nq_df), ("ZN", zn_df)], corr_windows=[10, 20, 60])
-        cross_cols = [c for c in cross.columns if c not in feature_cols]
-        feature_cols += cross_cols
-
-        try:
-            ext, ext_names = compute_external_features(es_daily)
-            feature_cols += [c for c in ext_names if c not in feature_cols]
-        except Exception as e:
-            logger.warning("External features failed: %s", e)
-            ext = pd.DataFrame(index=es_daily.index)
-
-        all_feats = pd.concat([tech, vp, macro, range_feats, cross, ext], axis=1)
-        all_feats = all_feats.reindex(es_daily.index).fillna(0)
-        return all_feats, feature_cols
+        return features, feature_cols
 
     def _compute_labels(self, es_daily: pd.DataFrame) -> pd.DataFrame:
-        from strategies.swing.labeling.structural_regime import compute_labels
-        return compute_labels(es_daily)
+        from strategies.swing.pipeline import compute_label_frame
+
+        return compute_label_frame(es_daily, config=self._swing_config)
+
+    def _build_training_frame(
+        self,
+        es_daily: pd.DataFrame,
+        nq_daily: pd.DataFrame,
+        zn_daily: pd.DataFrame,
+    ):
+        from strategies.swing.pipeline import build_training_frame
+
+        return build_training_frame(
+            es_daily=es_daily,
+            other_dailys=[("NQ", nq_daily), ("ZN", zn_daily)],
+            config=self._swing_config,
+            include_vp=True,
+            include_external=True,
+            include_range=True,
+            use_other_dailys_for_macro=True,
+        )
 
     # ------------------------------------------------------------------ #
     # Bootstrap: build caches once via full walk-forward
     # ------------------------------------------------------------------ #
+
+    def _ensure_cache_contract(self, feature_cols: list[str]) -> None:
+        from strategies.swing.training.regime_trainer import DEFAULT_PARAMS
+
+        required = {
+            "version": 3,
+            "feature_cols": list(feature_cols),
+            "n_folds": self._config.n_folds,
+            "min_train_days": self._config.min_train_days,
+            "hmm_n_states": self._config.hmm_n_states,
+        }
+        optional = {
+            "xgb_params": {k: v for k, v in DEFAULT_PARAMS.items()},
+            "anomaly_n_estimators": 200,
+        }
+        expected = {**required, **optional}
+
+        current = None
+        if CACHE_META.exists():
+            try:
+                current = json.loads(CACHE_META.read_text())
+            except Exception as e:
+                logger.warning("Failed to read cache contract metadata: %s", e)
+
+        if isinstance(current, dict):
+            required_match = all(current.get(k) == v for k, v in required.items())
+            optional_match = all((k not in current) or current.get(k) == v for k, v in optional.items())
+            if required_match and optional_match:
+                return
+
+        stale_paths = [p for p in [OOS_CACHE, ANOMALY_CACHE] if p.exists()]
+        if stale_paths:
+            logger.info("Invalidating prediction caches due to model contract change")
+            for path in stale_paths:
+                try:
+                    path.unlink()
+                except Exception as e:
+                    logger.warning("Failed to remove stale cache %s: %s", path, e)
+
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_META.write_text(json.dumps(expected, sort_keys=True, indent=2))
 
     def _ensure_historical_caches(
         self,
@@ -516,60 +551,18 @@ class SwingDashboardRunner:
         missing_dates: list,
     ) -> tuple[dict, list[tuple[str, float]]]:
         """Fast backlog fill: one model fit, predict all missing dates (hindsight-biased)."""
-        from strategies.swing.training.regime_trainer import DEFAULT_PARAMS
-        from strategies.swing.labeling.hmm_regime import compute_hmm_features_walkforward
-        from xgboost import XGBClassifier
-
-        if not missing_dates:
-            return {}, []
-
-        latest_idx = len(df_valid) - 1
-        if latest_idx < self._config.min_train_days:
-            neutral = {d: [0.33, 0.34, 0.33] for d in missing_dates}
-            return neutral, []
-
-        df_aug = df_valid.copy()
-        try:
-            hmm_train_end = int(es_daily.index.get_loc(df_valid.index[-1]))
-        except Exception:
-            hmm_train_end = latest_idx
-        hmm_feats = compute_hmm_features_walkforward(
-            es_daily, hmm_train_end, n_states=self._config.hmm_n_states
+        from strategies.swing.training.runtime_inference import (
+            fit_predict_proba_for_dates_fast,
         )
-        hmm_cols = [c for c in hmm_feats.columns if c not in df_aug.columns]
-        for c in hmm_cols:
-            df_aug[c] = hmm_feats[c].reindex(df_aug.index).fillna(0)
 
-        all_feat_cols = [c for c in feature_cols if c in df_aug.columns] + hmm_cols
-        X = df_aug[all_feat_cols].fillna(0).values
-        y = df_aug["y_structural"].values.astype(int)
-        X_train, y_train = X[:-1], y[:-1]
-        if len(X_train) == 0:
-            neutral = {d: [0.33, 0.34, 0.33] for d in missing_dates}
-            return neutral, []
-
-        missing_classes = set([0, 1, 2]) - set(np.unique(y_train))
-        if missing_classes:
-            for cls in missing_classes:
-                X_train = np.vstack([X_train, np.zeros((1, X_train.shape[1]))])
-                y_train = np.append(y_train, cls)
-
-        class_counts = np.maximum(np.bincount(y_train, minlength=3).astype(float), 1.0)
-        class_weights = len(y_train) / (3.0 * class_counts)
-        class_weights[0] *= 1.5
-        sample_weights = class_weights[y_train]
-
-        params = {k: v for k, v in DEFAULT_PARAMS.items() if k != "bear_upweight"}
-        model = XGBClassifier(**params)
-        model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
-
-        pred_idx = [int(df_valid.index.get_loc(d)) for d in missing_dates]
-        probas = model.predict_proba(X[pred_idx])
-        proba_map = {d: probas[i].tolist() for i, d in enumerate(missing_dates)}
-
-        top_idx = np.argsort(model.feature_importances_)[::-1][:10]
-        top_features = [(all_feat_cols[i], float(model.feature_importances_[i])) for i in top_idx]
-        return proba_map, top_features
+        return fit_predict_proba_for_dates_fast(
+            df_valid,
+            feature_cols,
+            es_daily,
+            missing_dates,
+            min_train_days=self._swing_config.min_train_days,
+            hmm_n_states=self._swing_config.hmm_n_states,
+        )
 
     def _score_missing_anomaly_fast(
         self,
@@ -613,61 +606,17 @@ class SwingDashboardRunner:
         pred_idx: int,
         pred_date=None,
     ) -> tuple[list[float], list[tuple[str, float]]]:
-        from strategies.swing.training.regime_trainer import DEFAULT_PARAMS
-        from strategies.swing.labeling.hmm_regime import compute_hmm_features_walkforward
-        from xgboost import XGBClassifier
+        from strategies.swing.training.runtime_inference import fit_predict_proba_for_index
 
-        cfg = self._config
-        n = len(df_valid)
-        if pred_idx < 0 or pred_idx >= n:
-            raise IndexError(f"pred_idx out of range: {pred_idx} (n={n})")
-
-        # Need at least min_train_days before the prediction row.
-        if pred_idx < cfg.min_train_days:
-            return [0.33, 0.34, 0.33], []
-
-        df_slice = df_valid.iloc[: pred_idx + 1].copy()
-
-        # HMM fitted on all rows before the prediction date.
-        hmm_train_end = pred_idx
-        if pred_date is not None:
-            try:
-                hmm_train_end = int(es_daily.index.get_loc(pred_date))
-            except Exception:
-                hmm_train_end = pred_idx
-        hmm_feats = compute_hmm_features_walkforward(es_daily, hmm_train_end, n_states=cfg.hmm_n_states)
-        hmm_cols = [c for c in hmm_feats.columns if c not in df_valid.columns]
-        for c in hmm_cols:
-            df_slice[c] = hmm_feats[c].reindex(df_slice.index).fillna(0)
-
-        all_feat_cols = [c for c in feature_cols if c in df_slice.columns] + hmm_cols
-        X = df_slice[all_feat_cols].fillna(0).values
-        y = df_slice["y_structural"].values.astype(int)
-
-        X_train, y_train = X[:-1], y[:-1]
-        X_today = X[-1:]
-        if len(X_train) == 0:
-            return [0.33, 0.34, 0.33], []
-
-        missing = set([0, 1, 2]) - set(np.unique(y_train))
-        if missing:
-            for cls in missing:
-                X_train = np.vstack([X_train, np.zeros((1, X_train.shape[1]))])
-                y_train = np.append(y_train, cls)
-
-        class_counts = np.maximum(np.bincount(y_train, minlength=3).astype(float), 1.0)
-        class_weights = len(y_train) / (3.0 * class_counts)
-        class_weights[0] *= 1.5
-        sample_weights = class_weights[y_train]
-
-        params = {k: v for k, v in DEFAULT_PARAMS.items() if k != "bear_upweight"}
-        model = XGBClassifier(**params)
-        model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
-
-        proba = model.predict_proba(X_today)[0].tolist()
-        top_idx = np.argsort(model.feature_importances_)[::-1][:10]
-        top_features = [(all_feat_cols[i], float(model.feature_importances_[i])) for i in top_idx]
-        return proba, top_features
+        return fit_predict_proba_for_index(
+            df_valid,
+            feature_cols,
+            es_daily,
+            pred_idx,
+            min_train_days=self._swing_config.min_train_days,
+            hmm_n_states=self._swing_config.hmm_n_states,
+            pred_date=pred_date,
+        )
 
     def _score_today_anomaly(self, df: pd.DataFrame, feature_cols: list[str]) -> float:
         """Backward-compatible wrapper for scoring anomaly on latest valid row."""
