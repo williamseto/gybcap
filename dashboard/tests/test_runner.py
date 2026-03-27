@@ -224,3 +224,21 @@ def test_dashboard_runner_config_strict_backfill_defaults():
     strict_cfg = DashboardRunnerConfig(strict_backfill=True)
     assert default_cfg.strict_backfill is False
     assert strict_cfg.strict_backfill is True
+
+
+def test_fetch_cross_instrument_dailys_requests_nq_zn_cl_gc(monkeypatch):
+    runner = SwingDashboardRunner(DashboardRunnerConfig())
+    idx = pd.DatetimeIndex(["2026-03-10"])
+    sample = pd.DataFrame({"close": [1.0]}, index=idx)
+    calls: list[str] = []
+
+    def fake_fetch(symbol: str) -> pd.DataFrame:
+        calls.append(symbol)
+        return sample
+
+    monkeypatch.setattr(runner._fetcher, "fetch_and_update", fake_fetch)
+
+    out = runner._fetch_cross_instrument_dailys()
+
+    assert calls == ["NQ", "ZN", "CL", "GC"]
+    assert list(out.keys()) == ["NQ", "ZN", "CL", "GC"]

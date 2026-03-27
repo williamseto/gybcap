@@ -15,11 +15,13 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
 ROOT = Path(__file__).resolve().parent.parent
 
-# yfinance symbol → cache parquet filename
+# dashboard symbol -> yfinance symbol
 YF_SYMBOLS = {
     "ES": "ES=F",
     "NQ": "NQ=F",
     "ZN": "ZN=F",
+    "CL": "CL=F",
+    "GC": "GC=F",
 }
 
 # yfinance symbol → raw_data CSV path (external CSVs read by external_daily.py)
@@ -39,7 +41,7 @@ OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 
 
 class DailyDataFetcher:
-    """Manages daily OHLCV caches for ES/NQ/ZN using yfinance top-up.
+    """Manages daily OHLCV caches for futures symbols using yfinance top-up.
 
     Two modes:
       csv_plus_yfinance (default): bootstraps from local minute CSVs,
@@ -56,7 +58,7 @@ class DailyDataFetcher:
     # ------------------------------------------------------------------ #
 
     def fetch_and_update(self, symbol: str) -> pd.DataFrame:
-        """Return up-to-date daily OHLCV for symbol (ES/NQ/ZN).
+        """Return up-to-date daily OHLCV for symbol (ES/NQ/ZN/CL/GC).
 
         Loads parquet cache → finds last date → fetches new bars from yfinance
         → deduplicates → saves → returns combined DataFrame.

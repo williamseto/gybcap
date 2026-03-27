@@ -52,6 +52,7 @@ CACHE_META     = CACHE_DIR / "cache_contract.json"
 
 RISK_WEIGHTS = {"range": 0.15, "anomaly": 0.25, "change": 0.60}
 _SWING_DEFAULTS = SwingConfig()
+_CROSS_INSTRUMENTS = ("NQ", "ZN", "CL", "GC")
 
 
 @dataclass
@@ -128,14 +129,15 @@ class SwingDashboardRunner:
         logger.info("Fetching daily data...")
         self._fetcher.topup_external_csvs()
         es_daily = self._fetcher.fetch_and_update("ES")
-        nq_daily = self._fetcher.fetch_and_update("NQ")
-        zn_daily = self._fetcher.fetch_and_update("ZN")
+        cross_dailys = self._fetch_cross_instrument_dailys()
+        nq_daily = cross_dailys["NQ"]
+        zn_daily = cross_dailys["ZN"]
         logger.info("Stage timing: data fetch %.2fs", time.perf_counter() - t_fetch)
 
         # ── 2. Compute features (vectorized, ~2s) ───────────────────────
         t_features = time.perf_counter()
         logger.info("Computing features (%d ES days)...", len(es_daily))
-        artifacts = self._build_training_frame(es_daily, nq_daily, zn_daily)
+        artifacts = self._build_training_frame(es_daily, cross_dailys)
         feature_cols = artifacts.feature_cols
         df = artifacts.df.dropna(subset=["y_structural"])
         logger.info("Stage timing: features+labels %.2fs", time.perf_counter() - t_features)
@@ -177,14 +179,13 @@ class SwingDashboardRunner:
     def _compute_features(
         self,
         es_daily: pd.DataFrame,
-        nq_daily: pd.DataFrame,
-        zn_daily: pd.DataFrame,
+        cross_dailys: dict[str, pd.DataFrame],
     ) -> tuple[pd.DataFrame, list[str]]:
         from strategies.swing.pipeline import compute_feature_frame
 
         features, feature_cols, _ = compute_feature_frame(
             es_daily=es_daily,
-            other_dailys=[("NQ", nq_daily), ("ZN", zn_daily)],
+            other_dailys=self._other_dailys(cross_dailys),
             include_vp=True,
             include_external=True,
             include_range=True,
@@ -201,20 +202,28 @@ class SwingDashboardRunner:
     def _build_training_frame(
         self,
         es_daily: pd.DataFrame,
-        nq_daily: pd.DataFrame,
-        zn_daily: pd.DataFrame,
+        cross_dailys: dict[str, pd.DataFrame],
     ):
         from strategies.swing.pipeline import build_training_frame
 
         return build_training_frame(
             es_daily=es_daily,
-            other_dailys=[("NQ", nq_daily), ("ZN", zn_daily)],
+            other_dailys=self._other_dailys(cross_dailys),
             config=self._swing_config,
             include_vp=True,
             include_external=True,
             include_range=True,
             use_other_dailys_for_macro=True,
         )
+
+    def _fetch_cross_instrument_dailys(self) -> dict[str, pd.DataFrame]:
+        out: dict[str, pd.DataFrame] = {}
+        for symbol in _CROSS_INSTRUMENTS:
+            out[symbol] = self._fetcher.fetch_and_update(symbol)
+        return out
+
+    def _other_dailys(self, cross_dailys: dict[str, pd.DataFrame]) -> list[tuple[str, pd.DataFrame]]:
+        return [(symbol, cross_dailys[symbol]) for symbol in _CROSS_INSTRUMENTS if symbol in cross_dailys]
 
     # ------------------------------------------------------------------ #
     # Bootstrap: build caches once via full walk-forward
