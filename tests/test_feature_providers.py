@@ -208,6 +208,67 @@ class TestPriceLevelProvider:
         assert 'ovn_lo' in levels
         assert 'ovn_hi' in levels
 
+    def test_rth_levels_track_from_open_but_activate_after_opening_range(self):
+        """RTH hi/lo should use 6:30+ extremes but only be active from 7:00 onward."""
+        provider = PriceLevelProvider(include_gamma=False)
+
+        dt = pd.date_range("2026-03-10 06:30:00", periods=36, freq="1min")
+        n = len(dt)
+        df = pd.DataFrame(
+            {
+                "dt": dt,
+                "trading_day": ["2026-03-10"] * n,
+                "open": np.full(n, 100.0),
+                "high": np.full(n, 102.0),
+                "low": np.full(n, 98.0),
+                "close": np.full(n, 100.0),
+                "volume": np.full(n, 1000.0),
+                "bidvolume": np.full(n, 500.0),
+                "askvolume": np.full(n, 500.0),
+                "ovn": np.zeros(n, dtype=np.int8),
+            }
+        )
+        # Opening-range extreme values.
+        df.loc[df["dt"] == pd.Timestamp("2026-03-10 06:32:00"), "high"] = 110.0
+        df.loc[df["dt"] == pd.Timestamp("2026-03-10 06:55:00"), "low"] = 90.0
+        # Post-OR values should not replace opening-range extremes at first activation bar.
+        df.loc[df["dt"] == pd.Timestamp("2026-03-10 07:00:00"), "high"] = 103.0
+        df.loc[df["dt"] == pd.Timestamp("2026-03-10 07:00:00"), "low"] = 97.0
+
+        out = provider._compute_impl(df)
+
+        row_659 = out.loc[out["dt"] == pd.Timestamp("2026-03-10 06:59:00")].iloc[0]
+        row_700 = out.loc[out["dt"] == pd.Timestamp("2026-03-10 07:00:00")].iloc[0]
+
+        # Not active before OR completion.
+        assert row_659["rth_hi"] == 0.0
+        assert row_659["rth_lo"] == 0.0
+        # Active at 7:00 with cumulative extremes from 6:30 onward.
+        assert row_700["rth_hi"] == 110.0
+        assert row_700["rth_lo"] == 90.0
+
+    def test_ofi_z_is_finite_with_flat_orderflow(self):
+        provider = PriceLevelProvider(include_gamma=False)
+        dt = pd.date_range("2026-03-10 06:30:00", periods=80, freq="1min")
+        n = len(dt)
+        df = pd.DataFrame(
+            {
+                "dt": dt,
+                "trading_day": ["2026-03-10"] * n,
+                "open": np.full(n, 100.0),
+                "high": np.full(n, 101.0),
+                "low": np.full(n, 99.0),
+                "close": np.full(n, 100.0),
+                "volume": np.full(n, 1000.0),
+                "bidvolume": np.full(n, 500.0),
+                "askvolume": np.full(n, 500.0),
+                "ovn": np.zeros(n, dtype=np.int8),
+            }
+        )
+        out = provider._compute_impl(df)
+        assert np.isfinite(out["ofi_z"].to_numpy()).all()
+        assert (out["ofi_z"] == 0.0).all()
+
 
 class TestFeatureProviderProtocol:
     """Tests for feature provider protocol."""
