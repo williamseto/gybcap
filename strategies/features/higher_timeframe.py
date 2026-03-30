@@ -438,27 +438,29 @@ class HigherTimeframeProvider(BaseFeatureProvider):
         weekly = self._compute_weekly_features(weekly)
         self._weekly_cache = weekly
 
-        # Map daily features to intraday bars (vectorized merge)
-        daily_feature_cols = (
-            self.DAILY_TREND_FEATURES +
-            self.DAILY_BB_FEATURES +
+        # Map daily features to intraday bars (causal):
+        # - End-of-day derived features are shifted by 1 day.
+        # - Prior-day and gap/open features are known at/after today's open.
+        daily_eod_cols = self.DAILY_TREND_FEATURES + self.DAILY_BB_FEATURES
+        daily_open_known_cols = (
             self.PRIOR_DAY_FEATURES +
-            ['gap_pct', 'gap_vs_prior_range', 'open_vs_prior_va',
-             'range_pct_of_prior_range', 'session_range_percentile',
-             'prior_va_width_actual']
+            ['gap_pct', 'gap_vs_prior_range', 'open_vs_prior_va']
         )
 
-        daily_cols_available = [c for c in daily_feature_cols if c in daily.columns]
-        if daily_cols_available:
-            daily_subset = daily[['trading_day'] + daily_cols_available].copy()
-            # Use merge for fast vectorized mapping
-            result = result.merge(
-                daily_subset,
-                on='trading_day',
-                how='left'
-            )
-            # Fill NaN with 0
-            for col in daily_cols_available:
+        eod_cols_available = [c for c in daily_eod_cols if c in daily.columns]
+        if eod_cols_available:
+            eod_subset = daily[['trading_day'] + eod_cols_available].copy()
+            eod_subset[eod_cols_available] = eod_subset[eod_cols_available].shift(1)
+            result = result.merge(eod_subset, on='trading_day', how='left')
+            for col in eod_cols_available:
+                if col in result.columns:
+                    result[col] = result[col].fillna(0.0)
+
+        open_cols_available = [c for c in daily_open_known_cols if c in daily.columns]
+        if open_cols_available:
+            open_subset = daily[['trading_day'] + open_cols_available].copy()
+            result = result.merge(open_subset, on='trading_day', how='left')
+            for col in open_cols_available:
                 if col in result.columns:
                     result[col] = result[col].fillna(0.0)
 
@@ -477,10 +479,19 @@ class HigherTimeframeProvider(BaseFeatureProvider):
         weekly_cols_available = [c for c in weekly_feature_cols if c in weekly.columns]
 
         if weekly_cols_available:
+            if not weekly['year_week'].is_unique:
+                dup_weeks = weekly.loc[weekly['year_week'].duplicated(), 'year_week'].astype(str).unique()
+                raise ValueError(
+                    "Weekly feature rows must be unique by year_week; duplicates="
+                    + ",".join(dup_weeks[:5])
+                )
             # Create day-to-week mapping
             day_week_map = daily[['trading_day', 'year_week']].copy()
-            # Get weekly features
-            weekly_subset = weekly[['year_week'] + weekly_cols_available].copy()
+            # Causal weekly features: use prior completed week's values.
+            weekly_shifted = weekly[['year_week', 'trading_day'] + weekly_cols_available].copy()
+            weekly_shifted = weekly_shifted.sort_values('trading_day').reset_index(drop=True)
+            weekly_shifted[weekly_cols_available] = weekly_shifted[weekly_cols_available].shift(1)
+            weekly_subset = weekly_shifted[['year_week'] + weekly_cols_available]
             # Merge day to week, then to result
             day_week_features = day_week_map.merge(weekly_subset, on='year_week', how='left')
             result = result.merge(
@@ -511,45 +522,69 @@ class HigherTimeframeProvider(BaseFeatureProvider):
         self, result: pd.DataFrame, daily: pd.DataFrame
     ) -> pd.DataFrame:
         """Compute intraday range exhaustion features."""
-        # Build ATR lookup
-        atr_map = daily.set_index('trading_day')['daily_atr_14'].to_dict()
-        prior_range_map = daily.set_index('trading_day')['prior_day_range'].to_dict()
+        daily_idx = daily.set_index('trading_day')
 
-        # Map daily-level features that were computed in _compute_daily_features
-        daily_range_feats = ['range_pct_of_prior_range', 'session_range_percentile',
-                             'prior_va_width_actual']
-        for feat in daily_range_feats:
-            if feat in daily.columns:
-                feat_map = daily.set_index('trading_day')[feat].to_dict()
-                result[feat] = result['trading_day'].map(feat_map).fillna(0.0)
+        # ATR must be causal: only use prior completed day ATR.
+        atr_map = daily_idx['daily_atr_14'].shift(1).to_dict()
+        prior_range_map = daily_idx['prior_day_range'].to_dict()
+        prior_va_width_map = daily_idx['prior_va_width_actual'].to_dict()
+        full_day_range_map = (daily_idx['high'] - daily_idx['low']).to_dict()
+
+        # Prior VA width is known at session open (derived from prior day).
+        result['prior_va_width_actual'] = result['trading_day'].map(prior_va_width_map).fillna(0.0)
 
         # Intraday running range / ATR (updates every bar)
+        n = len(result)
         range_pct_of_atr = np.zeros(len(result), dtype=np.float64)
+        range_pct_of_prior_range = np.zeros(len(result), dtype=np.float64)
         distance_from_open_atr = np.zeros(len(result), dtype=np.float64)
         remaining_atr_pct = np.ones(len(result), dtype=np.float64)
+        session_range_percentile = np.full(n, 0.5, dtype=np.float64)
 
-        for day, day_df in result.groupby('trading_day'):
-            day_mask = result['trading_day'] == day
-            atr = atr_map.get(day, 0)
-            if atr <= 0:
+        day_to_indices = result.groupby('trading_day').indices
+        prior_completed_ranges: List[float] = []
+
+        for day in daily['trading_day']:
+            day_idx_arr = day_to_indices.get(day)
+            if day_idx_arr is None or len(day_idx_arr) == 0:
                 continue
 
-            close_vals = result.loc[day_mask, 'close'].values
-            high_vals = result.loc[day_mask, 'high'].values
-            low_vals = result.loc[day_mask, 'low'].values
+            close_vals = result.iloc[day_idx_arr]['close'].values
+            high_vals = result.iloc[day_idx_arr]['high'].values
+            low_vals = result.iloc[day_idx_arr]['low'].values
 
             # Running range (cumulative high - cumulative low)
             cum_high = np.maximum.accumulate(high_vals)
             cum_low = np.minimum.accumulate(low_vals)
             running_range = cum_high - cum_low
 
-            range_pct_of_atr[day_mask.values] = running_range / atr
-            distance_from_open_atr[day_mask.values] = np.abs(close_vals - close_vals[0]) / atr
-            remaining_atr_pct[day_mask.values] = np.maximum(atr - running_range, 0) / atr
+            atr = atr_map.get(day, 0.0)
+            if atr and atr > 0:
+                range_pct_of_atr[day_idx_arr] = running_range / atr
+                distance_from_open_atr[day_idx_arr] = np.abs(close_vals - close_vals[0]) / atr
+                remaining_atr_pct[day_idx_arr] = np.maximum(atr - running_range, 0) / atr
+
+            prior_range = prior_range_map.get(day, 0.0)
+            if prior_range and prior_range > 0:
+                range_pct_of_prior_range[day_idx_arr] = running_range / prior_range
+
+            # Causal percentile: running range vs prior completed session ranges (max 20).
+            if prior_completed_ranges:
+                hist = np.array(prior_completed_ranges[-20:], dtype=np.float64)
+                hist = np.sort(hist)
+                if len(hist) > 0:
+                    pct = np.searchsorted(hist, running_range, side='right') / len(hist)
+                    session_range_percentile[day_idx_arr] = pct
+
+            completed_range = full_day_range_map.get(day)
+            if completed_range is not None and completed_range > 0:
+                prior_completed_ranges.append(float(completed_range))
 
         result['range_pct_of_atr'] = range_pct_of_atr
+        result['range_pct_of_prior_range'] = range_pct_of_prior_range
         result['distance_from_open_atr'] = distance_from_open_atr
         result['remaining_atr_pct'] = remaining_atr_pct
+        result['session_range_percentile'] = session_range_percentile
 
         return result
 

@@ -9,16 +9,13 @@ price=close, volume=volume.  This is the minimal representation that
 reconstructs the same 1-min bars through BarAggregator.
 """
 
-import datetime
-import zoneinfo
-
 import numpy as np
 import pandas as pd
 
 from strategies.realtime.data_source import (
-    get_trading_day_start_ts,
     get_prev_trading_day_start_ts,
 )
+from strategies.realtime.orderflow_columns import normalize_orderflow_columns
 
 
 class CSVDataSource:
@@ -26,7 +23,6 @@ class CSVDataSource:
 
     def __init__(self, csv_path: str, upsample: bool = False):
         self._df = self._load_csv(csv_path)
-        self._la = zoneinfo.ZoneInfo("America/Los_Angeles")
         self._upsample = upsample
 
     # ------------------------------------------------------------------
@@ -51,6 +47,8 @@ class CSVDataSource:
         if df['dt'].dt.tz is None:
             df['dt'] = df['dt'].dt.tz_localize('America/Los_Angeles')
         df['timestamp'] = df['dt'].astype(np.int64) // 10**9
+
+        df = normalize_orderflow_columns(df, copy=False)
 
         return df
 
@@ -122,15 +120,19 @@ class CSVDataSource:
     def _bars_to_ticks(bars: pd.DataFrame, upsample: bool = False) -> pd.DataFrame:
         """Convert 1-min bars to synthetic tick format for BarAggregator."""
         if bars.empty:
-            return pd.DataFrame(columns=['timestamp', 'price', 'volume', 'buys', 'sells'])
+            return pd.DataFrame(
+                columns=["timestamp", "price", "volume", "bidvolume", "askvolume"]
+            )
+
+        bars = normalize_orderflow_columns(bars, copy=True)
 
         if not upsample:
             ticks = pd.DataFrame({
                 'timestamp': bars['timestamp'].values,
                 'price': bars['close'].values,
                 'volume': bars['volume'].values,
-                'buys': bars.get('bidvolume', bars.get('buys', pd.Series(0, index=bars.index))).values,
-                'sells': bars.get('askvolume', bars.get('sells', pd.Series(0, index=bars.index))).values,
+                'bidvolume': bars.get('bidvolume', pd.Series(0.0, index=bars.index)).values,
+                'askvolume': bars.get('askvolume', pd.Series(0.0, index=bars.index)).values,
             })
             return ticks.reset_index(drop=True)
 
@@ -141,19 +143,19 @@ class CSVDataSource:
         lows = bars['low'].values
         closes = bars['close'].values
         volumes = bars['volume'].values
-        buys_col = bars.get('bidvolume', bars.get('buys', pd.Series(0, index=bars.index))).values
-        sells_col = bars.get('askvolume', bars.get('sells', pd.Series(0, index=bars.index))).values
+        bid_col = bars.get('bidvolume', pd.Series(0.0, index=bars.index)).values
+        ask_col = bars.get('askvolume', pd.Series(0.0, index=bars.index)).values
 
         n = len(bars)
         tick_ts = np.empty(n * 4, dtype=np.int64)
         tick_price = np.empty(n * 4, dtype=np.float64)
         tick_vol = np.empty(n * 4, dtype=np.float64)
-        tick_buys = np.empty(n * 4, dtype=np.float64)
-        tick_sells = np.empty(n * 4, dtype=np.float64)
+        tick_bid = np.empty(n * 4, dtype=np.float64)
+        tick_ask = np.empty(n * 4, dtype=np.float64)
 
         vol_quarter = volumes / 4.0
-        buys_quarter = buys_col / 4.0
-        sells_quarter = sells_col / 4.0
+        bid_quarter = bid_col / 4.0
+        ask_quarter = ask_col / 4.0
 
         for i in range(n):
             base = i * 4
@@ -169,13 +171,14 @@ class CSVDataSource:
             tick_price[base + 3] = closes[i]
 
             tick_vol[base:base + 4] = vol_quarter[i]
-            tick_buys[base:base + 4] = buys_quarter[i]
-            tick_sells[base:base + 4] = sells_quarter[i]
+            tick_bid[base:base + 4] = bid_quarter[i]
+            tick_ask[base:base + 4] = ask_quarter[i]
 
-        return pd.DataFrame({
+        out = pd.DataFrame({
             'timestamp': tick_ts,
             'price': tick_price,
             'volume': tick_vol,
-            'buys': tick_buys,
-            'sells': tick_sells,
+            'bidvolume': tick_bid,
+            'askvolume': tick_ask,
         })
+        return out

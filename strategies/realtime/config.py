@@ -1,7 +1,18 @@
 """Configuration dataclasses for the real-time engine."""
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+
+DEFAULT_LEVEL_COLS = [
+    "prev_high",
+    "prev_low",
+    "vwap",
+    "ovn_lo",
+    "ovn_hi",
+    "ib_lo",
+    "ib_hi",
+]
 
 
 @dataclass
@@ -24,33 +35,13 @@ class DatabaseConfig:
 
 
 @dataclass
-class StrategySlotConfig:
-    """Configuration for a single strategy slot."""
-    strategy_type: str                          # 'breakout' or 'reversion'
-    model_path: Optional[str] = None
-    level_cols: Optional[List[str]] = None
-    threshold_pct: float = 0.0012
-    lookahead_bars: int = 12
-    pred_threshold: float = 0.4
+class RealtimeStrategyConfig:
+    """Generic strategy slot that supports strategy-specific params."""
+
+    kind: str
+    params: Dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
-
-    def __post_init__(self):
-        if self.level_cols is None:
-            self.level_cols = [
-                'prev_high', 'prev_low', 'vwap',
-                'ovn_lo', 'ovn_hi', 'ib_lo', 'ib_hi',
-            ]
-
-
-@dataclass
-class ReversalPredictorSlotConfig:
-    """Configuration for the Phase 3 reversal predictor strategy."""
-    model_dir: str = 'models/reversal_phase3'
-    pred_threshold: float = 0.50
-    proximity_pts: float = 5.0
-    historical_csv_path: Optional[str] = None
-    warmup_days: int = 60
-    enabled: bool = True
+    name: Optional[str] = None
 
 
 @dataclass
@@ -74,42 +65,47 @@ class PlaybackConfig:
 class EngineConfig:
     """Top-level engine configuration."""
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
-    strategies: List[StrategySlotConfig] = field(default_factory=list)
-    reversal_predictor: Optional[ReversalPredictorSlotConfig] = None
-    range_predictor: Optional[RangePredictorSlotConfig] = None
+    strategy_configs: List[RealtimeStrategyConfig] = field(default_factory=list)
     update_interval_sec: float = 5.0
     gex_enabled: bool = True
     discord_enabled: bool = True
+    signal_jsonl_path: Optional[str] = None
+    signal_jsonl_truncate_on_start: bool = False
     range_predictions_path: str = 'sandbox/range_predictions.csv'
     max_window_sec: int = 120
 
+    def iter_enabled_strategy_configs(self) -> List[RealtimeStrategyConfig]:
+        return [cfg for cfg in self.strategy_configs if cfg.enabled]
+
     @classmethod
     def default(cls) -> "EngineConfig":
-        """Return config matching the original hardcoded behavior."""
+        """Return config matching original default behavior."""
         return cls(
             db=DatabaseConfig(),
-            strategies=[
-                StrategySlotConfig(
-                    strategy_type='breakout',
-                    model_path='bo_retest_model.json',
-                    level_cols=[
-                        'prev_high', 'prev_low', 'vwap',
-                        'ovn_lo', 'ovn_hi', 'ib_lo', 'ib_hi',
-                    ],
-                    threshold_pct=0.0012,
-                    lookahead_bars=12,
-                    pred_threshold=0.4,
+            strategy_configs=[
+                RealtimeStrategyConfig(
+                    kind="batch_breakout",
+                    name="breakout",
+                    params={
+                        "strategy_name": "breakout",
+                        "model_path": "bo_retest_model.json",
+                        "level_cols": list(DEFAULT_LEVEL_COLS),
+                        "threshold_pct": 0.0012,
+                        "lookahead_bars": 12,
+                        "pred_threshold": 0.4,
+                    },
                 ),
-                StrategySlotConfig(
-                    strategy_type='reversion',
-                    model_path='reversion_model.json',
-                    level_cols=[
-                        'prev_high', 'prev_low', 'vwap',
-                        'ovn_lo', 'ovn_hi', 'ib_lo', 'ib_hi',
-                    ],
-                    threshold_pct=0.0012,
-                    lookahead_bars=12,
-                    pred_threshold=0.4,
+                RealtimeStrategyConfig(
+                    kind="batch_reversion",
+                    name="reversion",
+                    params={
+                        "strategy_name": "reversion",
+                        "model_path": "reversion_model.json",
+                        "level_cols": list(DEFAULT_LEVEL_COLS),
+                        "threshold_pct": 0.0012,
+                        "lookahead_bars": 12,
+                        "pred_threshold": 0.4,
+                    },
                 ),
             ],
             update_interval_sec=5.0,

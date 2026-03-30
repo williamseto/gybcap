@@ -3,31 +3,28 @@
 import logging
 import time
 from collections import deque
-from typing import Dict, List, Optional, Type
+from typing import List, Optional
 
 import pandas as pd
 
-from strategies.breakout.strategy import BreakoutRetestStrategy
-from strategies.reversion.strategy import ReversionStrategy
-from strategies.realtime.config import EngineConfig, StrategySlotConfig, ReversalPredictorSlotConfig
-from strategies.realtime.data_source import MySQLSource, get_trading_day_start_ts
 from strategies.realtime.bar_aggregator import BarAggregator
+from strategies.realtime.config import EngineConfig
+from strategies.realtime.data_source import MySQLSource, get_trading_day_start_ts
 from strategies.realtime.level_provider import DayPriceLevelProvider
-from strategies.realtime.protocol import RealtimeStrategy, RealtimeSignal, BatchStrategyAdapter
+from strategies.realtime.protocol import RealtimeSignal, RealtimeStrategy
 from strategies.realtime.signal_handler import (
-    SignalHandler,
     CompositeSignalHandler,
     DiscordSignalHandler,
+    JsonlFileSignalHandler,
     LoggingSignalHandler,
+    SignalHandler,
+)
+from strategies.realtime.strategy_factory import (
+    RealtimeStrategyFactory,
+    create_default_strategy_factory,
 )
 
 logger = logging.getLogger(__name__)
-
-# Map strategy type names to batch strategy classes
-STRATEGY_REGISTRY: Dict[str, Type] = {
-    'breakout': BreakoutRetestStrategy,
-    'reversion': ReversionStrategy,
-}
 
 
 class RealtimeEngine:
@@ -36,13 +33,19 @@ class RealtimeEngine:
     and signal dispatch in a real-time loop.
     """
 
-    def __init__(self, config: EngineConfig, data_source=None):
+    def __init__(
+        self,
+        config: EngineConfig,
+        data_source=None,
+        strategy_factory: Optional[RealtimeStrategyFactory] = None,
+    ):
         self.config = config
 
         # Data pipeline
         self.data_source = data_source or MySQLSource(config.db)
         self.aggregator = BarAggregator()
         self.level_provider = DayPriceLevelProvider(self.data_source)
+        self.strategy_factory = strategy_factory or create_default_strategy_factory()
 
         # State
         self.raw_deque: deque = deque(maxlen=config.max_window_sec)
@@ -61,6 +64,7 @@ class RealtimeEngine:
         if config.gex_enabled:
             try:
                 from gex.gex_provider import RealtimeGEXProvider
+
                 self.gex_provider = RealtimeGEXProvider()
             except Exception as e:
                 logger.warning("GEX provider unavailable: %s", e)
@@ -78,54 +82,20 @@ class RealtimeEngine:
         logger.info("Removed strategy: %s", name)
 
     def _register_strategies_from_config(self) -> None:
-        """Create and register BatchStrategyAdapters from EngineConfig slots."""
-        for slot in self.config.strategies:
-            if not slot.enabled:
+        """Build and register strategies from unified strategy configs."""
+        for slot in self.config.iter_enabled_strategy_configs():
+            try:
+                strategy = self.strategy_factory.build(slot, self)
+                self.register_strategy(strategy)
+            except Exception as e:
+                logger.error(
+                    "Failed to register strategy kind=%s name=%s: %s",
+                    slot.kind,
+                    slot.name or "",
+                    e,
+                    exc_info=True,
+                )
                 continue
-            strategy_cls = STRATEGY_REGISTRY.get(slot.strategy_type)
-            if strategy_cls is None:
-                logger.warning("Unknown strategy type: %s", slot.strategy_type)
-                continue
-
-            adapter = BatchStrategyAdapter(
-                strategy_name=slot.strategy_type,
-                strategy_cls=strategy_cls,
-                level_provider=self.level_provider,
-                model_path=slot.model_path,
-                level_cols=slot.level_cols,
-                threshold_pct=slot.threshold_pct,
-                lookahead_bars=slot.lookahead_bars,
-                pred_threshold=slot.pred_threshold,
-            )
-            self.register_strategy(adapter)
-
-        # Register reversal predictor if configured
-        rp_config = self.config.reversal_predictor
-        if rp_config is not None and rp_config.enabled:
-            self._register_reversal_predictor(rp_config)
-
-    def _register_reversal_predictor(self, rp_config: ReversalPredictorSlotConfig) -> None:
-        """Create and register the Phase 3 reversal predictor strategy."""
-        try:
-            from strategies.reversal.realtime_strategy import ReversalPredictorStrategy
-
-            strategy = ReversalPredictorStrategy(
-                model_dir=rp_config.model_dir,
-                pred_threshold=rp_config.pred_threshold,
-                proximity_pts=rp_config.proximity_pts,
-            )
-
-            # Load historical context for feature warm-up
-            if rp_config.historical_csv_path:
-                from strategies.realtime.csv_data_source import CSVDataSource
-                csv_source = CSVDataSource(rp_config.historical_csv_path)
-                now_ts = int(time.time())
-                history = csv_source.fetch_history_bars(now_ts, n_days=rp_config.warmup_days)
-                strategy.set_historical_context(history)
-
-            self.register_strategy(strategy)
-        except Exception as e:
-            logger.error("Failed to register reversal predictor: %s", e, exc_info=True)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -169,6 +139,7 @@ class RealtimeEngine:
         # Register configured strategies
         if not self.strategies:
             self._register_strategies_from_config()
+        self._push_ticks_to_strategies(sec_df)
 
         logger.info(
             "Initialized: %d bars, %d strategies, day_end=%d",
@@ -203,21 +174,13 @@ class RealtimeEngine:
                     self.min_df.loc[new_rth.index, 'nearby_gamma_score'] = (
                         self.gex_provider.compute_gex_score_batch_mapped(new_rth)
                     )
-            except Exception:
-                pass
-
-        # 5) Run strategies
-        all_signals: List[RealtimeSignal] = []
-        for strategy in self.strategies:
-            try:
-                signals = strategy.process(self.min_df)
-                all_signals.extend(signals)
             except Exception as e:
-                logger.error("Strategy %s error: %s", strategy.name, e)
+                logger.warning("GEX update error: %s", e, exc_info=True)
 
-        # 6) Dispatch signals
-        if all_signals:
-            self.signal_handler.handle(all_signals)
+        self._push_ticks_to_strategies(df_new)
+
+        # 5/6) Run strategies + dispatch
+        self.run_strategy_pass(dispatch=True)
 
     def run(self) -> None:
         """Main loop: initialize then poll until trading day ends."""
@@ -234,6 +197,67 @@ class RealtimeEngine:
                 break
 
     # ------------------------------------------------------------------
+    # Replay hooks
+    # ------------------------------------------------------------------
+
+    def replay_to(self, end_ts: int, step_sec: int = 60, fast_forward: bool = False) -> None:
+        """Run update cycles until *end_ts*.
+
+        This uses the same `update()` path as live mode and is intended for
+        deterministic playback/backfill runs.
+        """
+        if self.last_ts is None:
+            raise RuntimeError("Engine must be initialized before replay_to().")
+
+        if end_ts <= self.last_ts:
+            return
+
+        step_sec = max(int(step_sec), 1)
+
+        if fast_forward:
+            self.update(int(end_ts))
+            return
+
+        sim_ts = int(self.last_ts) + step_sec
+        while sim_ts <= int(end_ts):
+            self.update(sim_ts)
+            sim_ts += step_sec
+
+    def run_strategy_pass(self, dispatch: bool = True) -> List[RealtimeSignal]:
+        """Run one strategy pass against current bars without fetching new ticks."""
+        all_signals: List[RealtimeSignal] = []
+        for strategy in self.strategies:
+            try:
+                signals = strategy.process(self.min_df)
+                all_signals.extend(signals)
+            except Exception as e:
+                logger.error("Strategy %s error: %s", strategy.name, e)
+
+        if dispatch and all_signals:
+            self.signal_handler.handle(all_signals)
+        return all_signals
+
+    def reset_day_state(self) -> None:
+        """Clear intraday engine state and reset strategies for the next session."""
+        self.min_df = self.min_df.iloc[0:0]
+        self.last_ts = None
+        self.raw_deque.clear()
+
+        for strategy in self.strategies:
+            reset_day = getattr(strategy, "reset_day", None)
+            if callable(reset_day):
+                try:
+                    reset_day()
+                    continue
+                except Exception as e:
+                    logger.warning("Strategy %s reset_day error: %s", strategy.name, e)
+            if hasattr(strategy, "_emitted"):
+                try:
+                    strategy._emitted.clear()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -243,4 +267,26 @@ class RealtimeEngine:
         composite.add(LoggingSignalHandler())
         if config.discord_enabled:
             composite.add(DiscordSignalHandler())
+        if config.signal_jsonl_path:
+            composite.add(
+                JsonlFileSignalHandler(
+                    output_path=str(config.signal_jsonl_path),
+                    truncate_on_start=bool(config.signal_jsonl_truncate_on_start),
+                )
+            )
         return composite
+
+    def _push_ticks_to_strategies(self, ticks_df: pd.DataFrame) -> None:
+        if ticks_df is None or ticks_df.empty:
+            return
+        for strategy in self.strategies:
+            on_new_ticks = getattr(strategy, "on_new_ticks", None)
+            if callable(on_new_ticks):
+                try:
+                    on_new_ticks(ticks_df)
+                except Exception as e:
+                    logger.warning(
+                        "Strategy %s on_new_ticks error: %s",
+                        getattr(strategy, "name", strategy.__class__.__name__),
+                        e,
+                    )

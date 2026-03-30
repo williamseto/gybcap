@@ -12,8 +12,9 @@ Usage:
 import gc
 import os
 import time
+import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -44,6 +45,9 @@ class FootprintResult:
     overall_win_rate: float
     overall_mean_pnl: float
     total_pnl: float
+    all_y_true: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int32))
+    all_y_prob: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    all_test_indices: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
 
 
 def _clear_gpu_memory():
@@ -52,6 +56,22 @@ def _clear_gpu_memory():
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def _set_random_seed(seed: int) -> None:
+    """Set random seeds for reproducible training runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     except ImportError:
         pass
 
@@ -140,10 +160,31 @@ class FootprintTrainer:
         n_folds: int = 5,
         min_train_days: int = 100,
         threshold: float = 0.50,
+        random_seed: int = 42,
+        model_arch: str = "cnn_fusion",
     ):
         self.n_folds = n_folds
         self.min_train_days = min_train_days
         self.threshold = threshold
+        self.random_seed = random_seed
+        self.model_arch = model_arch
+
+    def _build_model(
+        self,
+        scalar_dim: int,
+        n_price_bins: int,
+        current_time_steps: int,
+        context_time_steps: int,
+    ):
+        from strategies.reversal.footprint_bundle import build_footprint_model
+
+        return build_footprint_model(
+            model_arch=self.model_arch,
+            scalar_dim=scalar_dim,
+            n_price_bins=n_price_bins,
+            current_time_steps=current_time_steps,
+            context_time_steps=context_time_steps,
+        )
 
     def train(
         self,
@@ -177,12 +218,14 @@ class FootprintTrainer:
         from torch.utils.data import TensorDataset, DataLoader
         from torch.optim.lr_scheduler import OneCycleLR
         from sklearn.metrics import roc_auc_score
-        from strategies.reversal.orderflow_model import FootprintFusionModel
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _set_random_seed(self.random_seed)
         if verbose:
             print(f"\n{'=' * 70}")
-            print(f"FOOTPRINT MODEL TRAINING (device={device})")
+            print(
+                f"FOOTPRINT MODEL TRAINING (device={device}, arch={self.model_arch})"
+            )
             print(f"{'=' * 70}")
 
         # Filter to valid footprint samples
@@ -219,7 +262,7 @@ class FootprintTrainer:
         fold_results = []
         all_y_true = []
         all_y_prob = []
-        all_test_ohlcv_indices = []
+        all_test_indices = []
 
         for fold, (train_days, test_days) in enumerate(splits):
             if verbose:
@@ -254,8 +297,7 @@ class FootprintTrainer:
             val_within = np.array([d in val_day_set for d in train_day_vals])
             tr_within = ~val_within
 
-            # Build model
-            model = FootprintFusionModel(
+            model = self._build_model(
                 scalar_dim=len(feature_cols),
                 n_price_bins=current_fp.shape[2],
                 current_time_steps=current_fp.shape[3],
@@ -283,6 +325,7 @@ class FootprintTrainer:
                 batch_size=batch_size,
                 shuffle=True,
                 drop_last=True,
+                generator=torch.Generator().manual_seed(self.random_seed + fold),
             )
 
             # Validation data
@@ -422,7 +465,7 @@ class FootprintTrainer:
 
             all_y_true.extend(y_test.tolist())
             all_y_prob.extend(y_prob.tolist())
-            all_test_ohlcv_indices.extend(test_ohlcv_idx[pred_mask].tolist())
+            all_test_indices.extend(test_ohlcv_idx.tolist())
 
             # Cleanup
             del model, optimizer, scheduler, best_state
@@ -432,6 +475,7 @@ class FootprintTrainer:
         # Aggregate
         all_y_true = np.array(all_y_true)
         all_y_prob = np.array(all_y_prob)
+        all_test_indices = np.array(all_test_indices, dtype=np.int64)
 
         try:
             overall_auc = roc_auc_score(all_y_true, all_y_prob)
@@ -453,11 +497,201 @@ class FootprintTrainer:
                 print(f"  Total PnL: {total_pnl:+.1f}")
 
         return FootprintResult(
-            path_name="footprint_fusion",
+            path_name=self.model_arch,
             fold_results=fold_results,
             overall_roc_auc=overall_auc,
             total_trades=total_trades,
             overall_win_rate=total_wins / max(total_trades, 1),
             overall_mean_pnl=total_pnl / max(total_trades, 1),
             total_pnl=total_pnl,
+            all_y_true=all_y_true,
+            all_y_prob=all_y_prob,
+            all_test_indices=all_test_indices,
         )
+
+    def train_final_model(
+        self,
+        samples_df: pd.DataFrame,
+        feature_cols: List[str],
+        footprints: dict,
+        epochs: int = 25,
+        batch_size: int = 256,
+        lr: float = 1e-3,
+        val_day_fraction: float = 0.2,
+        verbose: bool = True,
+    ):
+        """Train one deployable model on all valid samples with temporal holdout."""
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+        from torch.optim.lr_scheduler import OneCycleLR
+        from sklearn.metrics import roc_auc_score
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _set_random_seed(self.random_seed)
+
+        valid_mask = footprints["valid_mask"]
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) == 0:
+            raise ValueError("No valid footprint samples available for final training")
+
+        current_fp = footprints["current"][valid_indices]
+        context_fp = footprints["context"][valid_indices]
+        scalars = (
+            samples_df.iloc[valid_indices][feature_cols]
+            .fillna(0)
+            .values.astype(np.float32)
+        )
+        y = (samples_df.iloc[valid_indices]["outcome"] == 1).astype(int).values
+        trading_days = samples_df.iloc[valid_indices]["trading_day"].astype(str).values
+
+        days = sorted(set(trading_days))
+        if len(days) < 5:
+            raise ValueError(
+                f"Need at least 5 trading days for final holdout, got {len(days)}"
+            )
+
+        val_day_count = max(1, int(round(len(days) * val_day_fraction)))
+        val_day_count = min(val_day_count, len(days) - 1)
+        val_days = set(days[-val_day_count:])
+        train_mask = ~np.isin(trading_days, list(val_days))
+        val_mask_arr = ~train_mask
+
+        y_train = y[train_mask]
+        y_val = y[val_mask_arr]
+        if y_train.sum() < 10 or len(y_val) < 32:
+            raise ValueError(
+                "Final split is too small; adjust data window or val_day_fraction"
+            )
+
+        model = self._build_model(
+            scalar_dim=len(feature_cols),
+            n_price_bins=current_fp.shape[2],
+            current_time_steps=current_fp.shape[3],
+            context_time_steps=context_fp.shape[3],
+        )
+        model.to(device)
+
+        if verbose:
+            print(f"\nTraining final deployable model ({self.model_arch}, device={device})")
+            print(
+                f"  samples={len(y):,}, train={int(train_mask.sum()):,}, "
+                f"val={int(val_mask_arr.sum()):,}, features={len(feature_cols)}"
+            )
+            print(f"  model params={model.count_parameters():,}")
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        loss_fn = nn.BCELoss()
+
+        train_dataset = TensorDataset(
+            torch.tensor(current_fp[train_mask]),
+            torch.tensor(context_fp[train_mask]),
+            torch.tensor(scalars[train_mask]),
+            torch.tensor(y_train.astype(np.float32)),
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            generator=torch.Generator().manual_seed(self.random_seed),
+        )
+
+        val_cur = torch.tensor(current_fp[val_mask_arr]).to(device)
+        val_ctx = torch.tensor(context_fp[val_mask_arr]).to(device)
+        val_sc = torch.tensor(scalars[val_mask_arr]).to(device)
+        val_target = torch.tensor(y_val.astype(np.float32)).to(device)
+
+        steps_per_epoch = len(train_loader)
+        if steps_per_epoch <= 0:
+            raise ValueError("No training batches for final model")
+
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            total_steps=epochs * steps_per_epoch,
+        )
+
+        best_val_loss = float("inf")
+        best_epoch = 0
+        best_state = None
+        patience = max(5, min(12, epochs // 2))
+        no_improve = 0
+
+        for epoch in range(epochs):
+            model.train()
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for batch in train_loader:
+                cur_b, ctx_b, sc_b, y_b = [x.to(device) for x in batch]
+                pred = model(cur_b, ctx_b, sc_b)
+                loss = loss_fn(pred, y_b)
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+
+                epoch_loss += float(loss.item())
+                n_batches += 1
+
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(val_cur, val_ctx, val_sc)
+                val_loss = float(loss_fn(val_pred, val_target).item())
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                best_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
+                no_improve = 0
+            else:
+                no_improve += 1
+
+            if verbose:
+                avg_loss = epoch_loss / max(n_batches, 1)
+                print(
+                    f"  epoch {epoch + 1:02d}/{epochs}: "
+                    f"train_loss={avg_loss:.4f}, val_loss={val_loss:.4f}"
+                )
+
+            if no_improve >= patience:
+                if verbose:
+                    print(f"  early stop at epoch {epoch + 1} (best={best_epoch + 1})")
+                break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        model.eval()
+        with torch.no_grad():
+            val_prob = model(val_cur, val_ctx, val_sc).detach().cpu().numpy()
+
+        try:
+            val_auc = float(roc_auc_score(y_val, val_prob))
+        except ValueError:
+            val_auc = 0.5
+
+        pred_mask = val_prob >= self.threshold
+        n_val_trades = int(pred_mask.sum())
+
+        summary: Dict[str, Any] = {
+            "model_arch": self.model_arch,
+            "device": str(device),
+            "n_samples_total": int(len(y)),
+            "n_train_samples": int(train_mask.sum()),
+            "n_val_samples": int(val_mask_arr.sum()),
+            "n_days_total": int(len(days)),
+            "n_val_days": int(len(val_days)),
+            "best_epoch": int(best_epoch + 1),
+            "best_val_loss": float(best_val_loss),
+            "val_auc": float(val_auc),
+            "val_pred_threshold": float(self.threshold),
+            "n_val_trades_at_threshold": n_val_trades,
+        }
+
+        return model, summary

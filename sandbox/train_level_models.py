@@ -28,18 +28,77 @@ import sys
 import time
 import numpy as np
 import pandas as pd
-from typing import List, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DATA_PATH = "raw_data/es_min_3y_clean_td_gamma.csv"
 FIGURE_DIR = "sandbox/figures/level_models"
 
-from strategies.labeling.reversal_zones import TRACKED_LEVELS
+from strategies.labeling.reversal_zones import TRACKED_LEVELS, ReversalBreakoutLabeler
+from strategies.labeling.near_level import (
+    assign_level_side,
+    compute_nearest_level_arrays,
+)
 
 STOP_PTS = 4.0
 TARGET_PTS = 6.0
 MAX_BARS = 45
+BASE_TRACKED_LEVELS = list(TRACKED_LEVELS)
+IB_RELATIVE_LEVELS_CORE = [
+    "ib_mid",
+    "ib_hi_ext_025",
+    "ib_hi_ext_050",
+    "ib_lo_ext_025",
+    "ib_lo_ext_050",
+]
+IB_RELATIVE_LEVELS_FULL = IB_RELATIVE_LEVELS_CORE + [
+    "ib_hi_ext_100",
+    "ib_lo_ext_100",
+]
+OR_LEVELS = [
+    "or5_hi",
+    "or5_lo",
+    "or5_mid",
+    "or15_hi",
+    "or15_lo",
+    "or15_mid",
+]
+PRIOR_RTH_LEVELS = [
+    "prior_rth_open",
+    "prior_rth_close",
+]
+VWAP_SIGMA_LEVEL_MULTS = {
+    "vwap_up_1s": +1.0,
+    "vwap_dn_1s": -1.0,
+    "vwap_up_15s": +1.5,
+    "vwap_dn_15s": -1.5,
+    "vwap_up_2s": +2.0,
+    "vwap_dn_2s": -2.0,
+}
+
+
+def _minute_of_day(ts: pd.Timestamp) -> int:
+    t = pd.Timestamp(ts)
+    if t.tzinfo is not None:
+        t = t.tz_convert("America/Los_Angeles")
+    return int(t.hour) * 60 + int(t.minute)
+
+
+def resolve_tracked_levels(
+    tracked_levels_override: Optional[List[str]] = None,
+    include_ib_relative: bool = False,
+    ib_relative_mode: str = "core",
+) -> List[str]:
+    """Resolve effective tracked levels for labeling/feature encoding."""
+    if tracked_levels_override:
+        return list(dict.fromkeys([str(x) for x in tracked_levels_override if str(x).strip()]))
+
+    levels = list(BASE_TRACKED_LEVELS)
+    if include_ib_relative:
+        ib_levels = IB_RELATIVE_LEVELS_CORE if ib_relative_mode == "core" else IB_RELATIVE_LEVELS_FULL
+        levels.extend(ib_levels)
+    return list(dict.fromkeys(levels))
 
 
 # ── Data loading (reused from signal_detection.py) ────────────────────────
@@ -56,27 +115,183 @@ def load_data(path: str) -> pd.DataFrame:
     return df
 
 
-def compute_levels(ohlcv: pd.DataFrame) -> pd.DataFrame:
+def compute_levels(ohlcv: pd.DataFrame, tracked_levels: Optional[List[str]] = None) -> pd.DataFrame:
     from strategies.features.price_levels import PriceLevelProvider
     print("\nComputing price levels...")
     plp = PriceLevelProvider(include_gamma='gamma_score' in ohlcv.columns)
     feat_df = plp._compute_impl(ohlcv)
 
     level_cols = ['vwap', 'ovn_lo', 'ovn_hi', 'rth_lo', 'rth_hi', 'ib_lo', 'ib_hi']
-    if 'dt' in feat_df.columns:
-        feat_df = feat_df.set_index('dt')
-    ohlcv_dt = ohlcv.set_index('dt') if 'dt' in ohlcv.columns else ohlcv
-    for col in level_cols:
-        if col in feat_df.columns:
-            ohlcv[col] = feat_df[col].reindex(ohlcv_dt.index).values
+    if 'level_1' in feat_df.columns:
+        feat_by_row = feat_df.set_index('level_1')
+        for col in level_cols:
+            if col in feat_by_row.columns:
+                ohlcv[col] = feat_by_row[col].reindex(ohlcv.index).values
+    else:
+        if 'dt' in feat_df.columns:
+            feat_df = feat_df.set_index('dt')
+        ohlcv_dt = ohlcv.set_index('dt') if 'dt' in ohlcv.columns else ohlcv
+        for col in level_cols:
+            if col in feat_df.columns:
+                src = feat_df[col]
+                if src.index.has_duplicates:
+                    src = src.groupby(level=0).last()
+                ohlcv[col] = src.reindex(ohlcv_dt.index).values
 
     levels = plp.prev_day_levels(ohlcv)
     ohlcv['prev_high'] = ohlcv['trading_day'].map(levels['prev_high'])
     ohlcv['prev_low'] = ohlcv['trading_day'].map(levels['prev_low'])
+
+    tracked_levels = tracked_levels or list(BASE_TRACKED_LEVELS)
+    tracked_level_set = set(tracked_levels)
+
+    # Ensure minute_of_day exists for all intraday-derived level families.
+    needs_minute_of_day = bool(
+        tracked_level_set
+        & (
+            set(IB_RELATIVE_LEVELS_FULL)
+            | set(OR_LEVELS)
+            | set(VWAP_SIGMA_LEVEL_MULTS.keys())
+        )
+    )
+    if needs_minute_of_day:
+        if "dt" not in ohlcv.columns:
+            raise ValueError("Missing dt column required to compute intraday levels.")
+        minute_of_day = pd.to_datetime(ohlcv["dt"], errors="coerce").map(_minute_of_day).astype(np.int32)
+        ohlcv["minute_of_day"] = minute_of_day
+
+    # Prior RTH open/close references (previous trading day constants).
+    if tracked_level_set & set(PRIOR_RTH_LEVELS):
+        if "minute_of_day" not in ohlcv.columns:
+            minute_of_day = pd.to_datetime(ohlcv["dt"], errors="coerce").map(_minute_of_day).astype(np.int32)
+            ohlcv["minute_of_day"] = minute_of_day
+        rth_mask = (ohlcv["minute_of_day"] >= 390) & (ohlcv["minute_of_day"] < 780)
+        rth = ohlcv.loc[rth_mask, ["trading_day", "open", "close"]].copy()
+        daily_rth_open = rth.groupby("trading_day")["open"].first() if not rth.empty else pd.Series(dtype=np.float64)
+        daily_rth_close = rth.groupby("trading_day")["close"].last() if not rth.empty else pd.Series(dtype=np.float64)
+        prior_rth_open = daily_rth_open.shift(1).to_dict()
+        prior_rth_close = daily_rth_close.shift(1).to_dict()
+        if "prior_rth_open" in tracked_level_set:
+            ohlcv["prior_rth_open"] = ohlcv["trading_day"].map(prior_rth_open)
+        if "prior_rth_close" in tracked_level_set:
+            ohlcv["prior_rth_close"] = ohlcv["trading_day"].map(prior_rth_close)
+
+    # Opening-range references (causal: available only after window completes).
+    if tracked_level_set & set(OR_LEVELS):
+        if "minute_of_day" not in ohlcv.columns:
+            minute_of_day = pd.to_datetime(ohlcv["dt"], errors="coerce").map(_minute_of_day).astype(np.int32)
+            ohlcv["minute_of_day"] = minute_of_day
+        for col in OR_LEVELS:
+            if col in tracked_level_set and col not in ohlcv.columns:
+                ohlcv[col] = np.nan
+
+        for _, g in ohlcv.groupby("trading_day", sort=False):
+            gi = g.index
+            mod = ohlcv.loc[gi, "minute_of_day"].to_numpy(dtype=np.int32, copy=False)
+            highs = ohlcv.loc[gi, "high"].to_numpy(dtype=np.float64, copy=False)
+            lows = ohlcv.loc[gi, "low"].to_numpy(dtype=np.float64, copy=False)
+
+            # OR5: 6:30-6:34 (inclusive), active from 6:35 onward.
+            if tracked_level_set & {"or5_hi", "or5_lo", "or5_mid"}:
+                or5_mask = (mod >= 390) & (mod <= 394)
+                if np.any(or5_mask):
+                    or5_hi = float(np.nanmax(highs[or5_mask]))
+                    or5_lo = float(np.nanmin(lows[or5_mask]))
+                    valid = gi[mod >= 395]
+                    if len(valid) > 0:
+                        if "or5_hi" in tracked_level_set:
+                            ohlcv.loc[valid, "or5_hi"] = or5_hi
+                        if "or5_lo" in tracked_level_set:
+                            ohlcv.loc[valid, "or5_lo"] = or5_lo
+                        if "or5_mid" in tracked_level_set:
+                            ohlcv.loc[valid, "or5_mid"] = (or5_hi + or5_lo) / 2.0
+
+            # OR15: 6:30-6:44 (inclusive), active from 6:45 onward.
+            if tracked_level_set & {"or15_hi", "or15_lo", "or15_mid"}:
+                or15_mask = (mod >= 390) & (mod <= 404)
+                if np.any(or15_mask):
+                    or15_hi = float(np.nanmax(highs[or15_mask]))
+                    or15_lo = float(np.nanmin(lows[or15_mask]))
+                    valid = gi[mod >= 405]
+                    if len(valid) > 0:
+                        if "or15_hi" in tracked_level_set:
+                            ohlcv.loc[valid, "or15_hi"] = or15_hi
+                        if "or15_lo" in tracked_level_set:
+                            ohlcv.loc[valid, "or15_lo"] = or15_lo
+                        if "or15_mid" in tracked_level_set:
+                            ohlcv.loc[valid, "or15_mid"] = (or15_hi + or15_lo) / 2.0
+
+    # VWAP sigma bands (causal running dispersion around VWAP).
+    if tracked_level_set & set(VWAP_SIGMA_LEVEL_MULTS.keys()):
+        for col in VWAP_SIGMA_LEVEL_MULTS:
+            if col in tracked_level_set and col not in ohlcv.columns:
+                ohlcv[col] = np.nan
+        for _, g in ohlcv.groupby("trading_day", sort=False):
+            gi = g.index
+            vwap = ohlcv.loc[gi, "vwap"].to_numpy(dtype=np.float64, copy=False)
+            tp = (
+                ohlcv.loc[gi, "open"].to_numpy(dtype=np.float64, copy=False)
+                + ohlcv.loc[gi, "high"].to_numpy(dtype=np.float64, copy=False)
+                + ohlcv.loc[gi, "low"].to_numpy(dtype=np.float64, copy=False)
+                + ohlcv.loc[gi, "close"].to_numpy(dtype=np.float64, copy=False)
+            ) / 4.0
+            dev = tp - vwap
+            sigma = pd.Series(dev).expanding(min_periods=10).std().to_numpy(dtype=np.float64, copy=False)
+            valid_sigma = np.isfinite(sigma) & np.isfinite(vwap)
+            if not np.any(valid_sigma):
+                continue
+            for col, mult in VWAP_SIGMA_LEVEL_MULTS.items():
+                if col not in tracked_level_set:
+                    continue
+                band = vwap + float(mult) * sigma
+                out = np.full(len(gi), np.nan, dtype=np.float64)
+                out[valid_sigma] = band[valid_sigma]
+                ohlcv.loc[gi, col] = out
+
+    needs_ib_relative = any(
+        lvl in set(IB_RELATIVE_LEVELS_FULL) for lvl in tracked_levels
+    )
+    if needs_ib_relative:
+        # IB-derived references are causal only after IB completion (7:30 PT).
+        if "minute_of_day" not in ohlcv.columns:
+            if "dt" not in ohlcv.columns:
+                raise ValueError("Missing dt column required to compute IB-relative levels.")
+            minute_of_day = pd.to_datetime(ohlcv["dt"], errors="coerce").map(_minute_of_day).astype(np.int32)
+            ohlcv["minute_of_day"] = minute_of_day
+        else:
+            minute_of_day = ohlcv["minute_of_day"]
+        ib_lo = ohlcv["ib_lo"].to_numpy(dtype=np.float64, copy=False)
+        ib_hi = ohlcv["ib_hi"].to_numpy(dtype=np.float64, copy=False)
+        valid_ib = (
+            (minute_of_day.to_numpy(dtype=np.int32, copy=False) >= 450)
+            & np.isfinite(ib_lo)
+            & np.isfinite(ib_hi)
+            & (ib_hi > ib_lo)
+        )
+        ib_range = ib_hi - ib_lo
+        if "ib_mid" in tracked_levels:
+            ohlcv["ib_mid"] = np.where(valid_ib, (ib_hi + ib_lo) / 2.0, np.nan)
+        if "ib_hi_ext_025" in tracked_levels:
+            ohlcv["ib_hi_ext_025"] = np.where(valid_ib, ib_hi + 0.25 * ib_range, np.nan)
+        if "ib_hi_ext_050" in tracked_levels:
+            ohlcv["ib_hi_ext_050"] = np.where(valid_ib, ib_hi + 0.50 * ib_range, np.nan)
+        if "ib_hi_ext_100" in tracked_levels:
+            ohlcv["ib_hi_ext_100"] = np.where(valid_ib, ib_hi + 1.00 * ib_range, np.nan)
+        if "ib_lo_ext_025" in tracked_levels:
+            ohlcv["ib_lo_ext_025"] = np.where(valid_ib, ib_lo - 0.25 * ib_range, np.nan)
+        if "ib_lo_ext_050" in tracked_levels:
+            ohlcv["ib_lo_ext_050"] = np.where(valid_ib, ib_lo - 0.50 * ib_range, np.nan)
+        if "ib_lo_ext_100" in tracked_levels:
+            ohlcv["ib_lo_ext_100"] = np.where(valid_ib, ib_lo - 1.00 * ib_range, np.nan)
+
     return ohlcv
 
 
-def compute_all_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+def compute_all_features(
+    ohlcv: pd.DataFrame,
+    same_day_bidask_only: bool = False,
+    include_intraday_regime_features: bool = False,
+) -> Tuple[pd.DataFrame, List[str]]:
     """Compute all feature providers on the data."""
     feature_cols = []
 
@@ -101,7 +316,7 @@ def compute_all_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
 
     print("Computing reversion quality features...")
     from strategies.features.reversion_quality import ReversionQualityProvider
-    rqp = ReversionQualityProvider()
+    rqp = ReversionQualityProvider(same_day_bidask_only=same_day_bidask_only)
     qual_df = rqp._compute_impl(ohlcv)
     for col in rqp.feature_names:
         if col in qual_df.columns:
@@ -117,6 +332,85 @@ def compute_all_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
             ohlcv[col] = temp_df[col].values
             feature_cols.append(col)
 
+    # RTH running-level stability features: quantify how quickly rth_lo/rth_hi
+    # are moving, which helps separate stable references from churny volatility.
+    if "rth_lo" in ohlcv.columns and "rth_hi" in ohlcv.columns:
+        print("Computing RTH level-stability features...")
+
+        def _age_since_change(vals: np.ndarray, valid: np.ndarray) -> np.ndarray:
+            out = np.zeros_like(vals, dtype=np.float32)
+            last_change = -1
+            prev = np.nan
+            for i in range(len(vals)):
+                if not valid[i] or not np.isfinite(vals[i]):
+                    out[i] = 0.0
+                    continue
+                cur = float(vals[i])
+                if not np.isfinite(prev) or abs(cur - prev) > 1e-9:
+                    last_change = i
+                out[i] = float(i - last_change) if last_change >= 0 else 0.0
+                prev = cur
+            return out
+
+        ohlcv["rth_lo_age_bars"] = 0.0
+        ohlcv["rth_hi_age_bars"] = 0.0
+        ohlcv["rth_lo_updates_30"] = 0.0
+        ohlcv["rth_hi_updates_30"] = 0.0
+        ohlcv["rth_level_firmness"] = 0.0
+
+        for _, g in ohlcv.groupby("trading_day", sort=False):
+            gi = g.index
+            lo = ohlcv.loc[gi, "rth_lo"].to_numpy(dtype=np.float64, copy=False)
+            hi = ohlcv.loc[gi, "rth_hi"].to_numpy(dtype=np.float64, copy=False)
+            valid = np.isfinite(lo) & np.isfinite(hi) & (lo != 0.0) & (hi != 0.0)
+            if not np.any(valid):
+                continue
+
+            lo_chg = np.zeros(len(gi), dtype=np.float32)
+            hi_chg = np.zeros(len(gi), dtype=np.float32)
+            lo_chg[1:] = (
+                valid[1:]
+                & valid[:-1]
+                & (np.abs(lo[1:] - lo[:-1]) > 1e-9)
+            ).astype(np.float32)
+            hi_chg[1:] = (
+                valid[1:]
+                & valid[:-1]
+                & (np.abs(hi[1:] - hi[:-1]) > 1e-9)
+            ).astype(np.float32)
+
+            lo_updates_30 = pd.Series(lo_chg).rolling(30, min_periods=1).sum().to_numpy(dtype=np.float32)
+            hi_updates_30 = pd.Series(hi_chg).rolling(30, min_periods=1).sum().to_numpy(dtype=np.float32)
+            lo_age = _age_since_change(lo, valid)
+            hi_age = _age_since_change(hi, valid)
+            firmness = 1.0 / (1.0 + lo_updates_30 + hi_updates_30)
+
+            ohlcv.loc[gi, "rth_lo_age_bars"] = lo_age
+            ohlcv.loc[gi, "rth_hi_age_bars"] = hi_age
+            ohlcv.loc[gi, "rth_lo_updates_30"] = lo_updates_30
+            ohlcv.loc[gi, "rth_hi_updates_30"] = hi_updates_30
+            ohlcv.loc[gi, "rth_level_firmness"] = firmness
+
+        feature_cols.extend([
+            "rth_lo_age_bars",
+            "rth_hi_age_bars",
+            "rth_lo_updates_30",
+            "rth_hi_updates_30",
+            "rth_level_firmness",
+        ])
+
+    if include_intraday_regime_features:
+        print("Computing intraday regime/context features...")
+        from strategies.features.intraday_regime import (
+            INTRADAY_REGIME_FEATURES,
+            compute_intraday_regime_features,
+        )
+        regime_df = compute_intraday_regime_features(ohlcv)
+        for col in INTRADAY_REGIME_FEATURES:
+            if col in regime_df.columns:
+                ohlcv[col] = regime_df[col].values.astype(np.float32)
+                feature_cols.append(col)
+
     feature_cols = list(dict.fromkeys(feature_cols))
     print(f"  Total base features: {len(feature_cols)}")
     return ohlcv, feature_cols
@@ -124,10 +418,18 @@ def compute_all_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
 
 # ── Labeling (reused from signal_detection.py) ───────────────────────────
 
-def label_reversals_breakouts(ohlcv: pd.DataFrame, proximity_pts: float = 5.0,
-                               forward_bars: int = 45,
-                               reversal_pts: float = 6.0,
-                               breakout_pts: float = 4.0) -> pd.DataFrame:
+def label_reversals_breakouts(
+    ohlcv: pd.DataFrame,
+    proximity_pts: float = 5.0,
+    forward_bars: int = 45,
+    reversal_pts: float = 6.0,
+    breakout_pts: float = 4.0,
+    tracked_levels: Optional[List[str]] = None,
+    side_hysteresis_pts: float = 0.0,
+    side_flip_confirm_pts: Optional[float] = None,
+    drop_ambiguous_direction: bool = False,
+    ambiguity_bar_tolerance: int = 2,
+) -> pd.DataFrame:
     """Label near-level bars as reversal (1), breakout (0), or inconclusive (2)."""
     print(f"\nLabeling reversals/breakouts (proximity={proximity_pts}pt, "
           f"reversal={reversal_pts}pt, breakout={breakout_pts}pt)...")
@@ -138,32 +440,39 @@ def label_reversals_breakouts(ohlcv: pd.DataFrame, proximity_pts: float = 5.0,
     n = len(ohlcv)
 
     labels = np.full(n, -1, dtype=np.int32)
-    nearest_level_name = np.empty(n, dtype=object)
+    nearest_level_name = np.full(n, None, dtype=object)
     nearest_level_price = np.full(n, np.nan)
     side_arr = np.zeros(n, dtype=np.int8)  # 1=above(support), -1=below(resistance)
     trade_dir_arr = np.zeros(n, dtype=np.int8)
 
+    tracked_levels = tracked_levels or list(BASE_TRACKED_LEVELS)
+
     # Collect level arrays
     level_arrs = {}
-    for lvl_name in TRACKED_LEVELS:
+    for lvl_name in tracked_levels:
         if lvl_name in ohlcv.columns:
             level_arrs[lvl_name] = ohlcv[lvl_name].values.astype(np.float64)
 
-    # Find nearest level for each bar
-    for lvl_name, lvl_vals in level_arrs.items():
-        for i in range(n):
-            d = abs(close_arr[i] - lvl_vals[i])
-            if np.isnan(d):
-                continue
-            if d <= proximity_pts:
-                prev_dist = abs(close_arr[i] - nearest_level_price[i]) if not np.isnan(nearest_level_price[i]) else np.inf
-                if d < prev_dist:
-                    nearest_level_name[i] = lvl_name
-                    nearest_level_price[i] = lvl_vals[i]
+    nearest_level_name, nearest_level_price = compute_nearest_level_arrays(
+        close_arr,
+        level_arrs,
+        proximity_pts=float(proximity_pts),
+    )
 
     near_level_mask = ~np.isnan(nearest_level_price)
     n_near = near_level_mask.sum()
     print(f"  {n_near:,} near-level bars out of {n:,} ({100*n_near/n:.1f}%)")
+
+    side_arr = assign_level_side(
+        close_arr,
+        nearest_level_name,
+        nearest_level_price,
+        side_hysteresis_pts=float(side_hysteresis_pts),
+        side_flip_confirm_pts=(
+            float(side_flip_confirm_pts) if side_flip_confirm_pts is not None else None
+        ),
+        trading_day=ohlcv['trading_day'].values if 'trading_day' in ohlcv.columns else None,
+    )
 
     # Label each near-level bar
     for i in range(n):
@@ -172,9 +481,8 @@ def label_reversals_breakouts(ohlcv: pd.DataFrame, proximity_pts: float = 5.0,
 
         level = nearest_level_price[i]
         price = close_arr[i]
-        is_above = price >= level
-        side_arr[i] = 1 if is_above else -1
-        trade_dir_arr[i] = 1 if is_above else -1  # long above support, short below resistance
+        is_above = side_arr[i] >= 1
+        trade_dir_arr[i] = side_arr[i]  # long above support, short below resistance
 
         end = min(i + 1 + forward_bars, n)
         future_highs = high_arr[i+1:end]
@@ -196,12 +504,44 @@ def label_reversals_breakouts(ohlcv: pd.DataFrame, proximity_pts: float = 5.0,
         first_rev = (rev_hits[0]) if len(rev_hits) > 0 else 9999
         first_brk = (brk_hits[0]) if len(brk_hits) > 0 else 9999
 
+        assigned = 2
+        assigned_bar = 9999
         if first_rev < first_brk and first_rev < 9999:
-            labels[i] = 1  # reversal
+            assigned = 1  # reversal
+            assigned_bar = int(first_rev)
         elif first_brk < first_rev and first_brk < 9999:
-            labels[i] = 0  # breakout
-        else:
-            labels[i] = 2  # inconclusive
+            assigned = 0  # breakout
+            assigned_bar = int(first_brk)
+
+        if drop_ambiguous_direction and assigned in (0, 1):
+            if is_above:
+                # Opposite side assumption (below level)
+                opp_rev_hits = np.where(future_lows <= price - reversal_pts)[0]
+                opp_brk_hits = np.where(future_highs >= level + breakout_pts)[0]
+            else:
+                # Opposite side assumption (above level)
+                opp_rev_hits = np.where(future_highs >= price + reversal_pts)[0]
+                opp_brk_hits = np.where(future_lows <= level - breakout_pts)[0]
+
+            opp_first_rev = (opp_rev_hits[0]) if len(opp_rev_hits) > 0 else 9999
+            opp_first_brk = (opp_brk_hits[0]) if len(opp_brk_hits) > 0 else 9999
+            if opp_first_rev < opp_first_brk and opp_first_rev < 9999:
+                opp = 1
+                opp_bar = int(opp_first_rev)
+            elif opp_first_brk < opp_first_rev and opp_first_brk < 9999:
+                opp = 0
+                opp_bar = int(opp_first_brk)
+            else:
+                opp = 2
+                opp_bar = 9999
+            if (
+                opp in (0, 1)
+                and opp != assigned
+                and opp_bar <= (assigned_bar + max(int(ambiguity_bar_tolerance), 0))
+            ):
+                assigned = 2
+
+        labels[i] = assigned  # 1=reversal, 0=breakout, 2=inconclusive
 
     ohlcv['outcome'] = labels
     ohlcv['nearest_level_name'] = nearest_level_name
@@ -219,9 +559,303 @@ def label_reversals_breakouts(ohlcv: pd.DataFrame, proximity_pts: float = 5.0,
     return ohlcv
 
 
+def label_reversals_breakouts_structural(
+    ohlcv: pd.DataFrame,
+    proximity_pts: float = 5.0,
+    forward_bars: int = 60,
+    reversal_pts: float = 12.0,
+    breakout_pts: float = 6.0,
+    tracked_levels: Optional[List[str]] = None,
+    side_hysteresis_pts: float = 0.5,
+    side_flip_confirm_pts: Optional[float] = None,
+    drop_ambiguous_direction: bool = False,
+    ambiguity_bar_tolerance: int = 2,
+) -> pd.DataFrame:
+    """
+    Structural label path reused from ReversalBreakoutLabeler.
+
+    Returns same output columns as ``label_reversals_breakouts``:
+    - outcome: 1 reversal, 0 breakout, 2 inconclusive
+    - nearest_level_name, nearest_level_price, side, trade_direction
+    """
+    levels = tracked_levels or list(BASE_TRACKED_LEVELS)
+    labeler = ReversalBreakoutLabeler(
+        proximity_pts=float(proximity_pts),
+        forward_window=int(forward_bars),
+        reversal_threshold_pts=float(reversal_pts),
+        breakout_threshold_pts=float(breakout_pts),
+        decay_alpha=0.3,
+        side_hysteresis_pts=float(side_hysteresis_pts),
+        side_flip_confirm_pts=(
+            float(side_flip_confirm_pts) if side_flip_confirm_pts is not None else None
+        ),
+        drop_ambiguous_direction=bool(drop_ambiguous_direction),
+        ambiguity_bar_tolerance=int(ambiguity_bar_tolerance),
+        tracked_levels=levels,
+    )
+    labeled = labeler.fit(ohlcv)
+
+    out = ohlcv.copy()
+    out["nearest_level_name"] = labeled["nearest_level"].astype(object)
+    out["nearest_level_price"] = np.nan
+    near_mask = labeled["near_level"].fillna(False).values
+    if near_mask.any():
+        for lvl in levels:
+            if lvl not in out.columns:
+                continue
+            m = near_mask & (out["nearest_level_name"].values == lvl)
+            if not np.any(m):
+                continue
+            out.loc[m, "nearest_level_price"] = out.loc[m, lvl].values
+
+    out["side"] = labeled["side"].astype(np.int8).values
+    out["trade_direction"] = labeled["trade_direction"].astype(np.int8).values
+
+    outcome = np.full(len(out), -1, dtype=np.int32)
+    near_outcome = labeled["outcome"].astype(str).values
+    outcome[(near_outcome == "reversal")] = 1
+    outcome[(near_outcome == "breakout")] = 0
+    outcome[(near_outcome == "inconclusive")] = 2
+    out["outcome"] = outcome
+
+    n_near = int(near_mask.sum())
+    n_rev = int((outcome == 1).sum())
+    n_bo = int((outcome == 0).sum())
+    n_inc = int((outcome == 2).sum())
+    print(
+        f"\nStructural labeling (proximity={proximity_pts}pt, "
+        f"reversal={reversal_pts}pt, breakout={breakout_pts}pt, "
+        f"forward={forward_bars}, side_hyst={side_hysteresis_pts})..."
+    )
+    print(f"  {n_near:,} near-level bars out of {len(out):,} ({100*n_near/max(len(out),1):.1f}%)")
+    print(f"  Reversal: {n_rev:,} ({100*n_rev/max(n_near,1):.1f}%)")
+    print(f"  Breakout: {n_bo:,} ({100*n_bo/max(n_near,1):.1f}%)")
+    print(f"  Inconclusive: {n_inc:,} ({100*n_inc/max(n_near,1):.1f}%)")
+
+    return out
+
+
+def label_reversals_major_move(
+    ohlcv: pd.DataFrame,
+    proximity_pts: float = 5.0,
+    forward_bars: int = 60,
+    reversal_pts: float = 6.0,
+    breakout_pts: float = 4.0,
+    tracked_levels: Optional[List[str]] = None,
+    side_hysteresis_pts: float = 0.5,
+    side_flip_confirm_pts: Optional[float] = None,
+    excursion_ratio: float = 1.4,
+    breakout_excursion_ratio: float = 1.2,
+    terminal_disp_frac: float = 0.20,
+    use_volatility_scaling: bool = True,
+    volatility_col: str = "daily_atr_14",
+    reversal_vol_mult: float = 0.10,
+    breakout_vol_mult: float = 0.08,
+    drop_near_threshold_ambiguity: bool = False,
+    ambiguity_margin_frac: float = 0.0,
+    ambiguity_ratio_buffer: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Label near-level bars by excursion quality, decoupled from stop-first ordering.
+
+    Positive (reversal):
+      - aligned MFE exceeds threshold, and
+      - aligned/adverse excursion ratio exceeds `excursion_ratio`, and
+      - terminal displacement is aligned.
+    Negative (breakout/failure):
+      - adverse excursion exceeds threshold, and
+      - adverse/aligned ratio exceeds `breakout_excursion_ratio`, and
+      - terminal displacement is adverse.
+
+    Everything else is marked inconclusive to avoid ambiguous supervision.
+    """
+    print(
+        f"\nLabeling major-move outcomes (proximity={proximity_pts}pt, "
+        f"forward={forward_bars}, excursion_ratio={excursion_ratio}, "
+        f"use_vol_scaling={use_volatility_scaling})..."
+    )
+
+    close_arr = ohlcv["close"].values.astype(np.float64)
+    high_arr = ohlcv["high"].values.astype(np.float64)
+    low_arr = ohlcv["low"].values.astype(np.float64)
+    n = len(ohlcv)
+
+    labels = np.full(n, -1, dtype=np.int32)
+    nearest_level_name = np.full(n, None, dtype=object)
+    nearest_level_price = np.full(n, np.nan)
+    side_arr = np.zeros(n, dtype=np.int8)
+    trade_dir_arr = np.zeros(n, dtype=np.int8)
+
+    tracked_levels = tracked_levels or list(BASE_TRACKED_LEVELS)
+    level_arrs = {}
+    for lvl_name in tracked_levels:
+        if lvl_name in ohlcv.columns:
+            level_arrs[lvl_name] = ohlcv[lvl_name].values.astype(np.float64)
+
+    nearest_level_name, nearest_level_price = compute_nearest_level_arrays(
+        close_arr,
+        level_arrs,
+        proximity_pts=float(proximity_pts),
+    )
+    near_level_mask = ~np.isnan(nearest_level_price)
+    n_near = int(near_level_mask.sum())
+    print(f"  {n_near:,} near-level bars out of {n:,} ({100*n_near/max(n,1):.1f}%)")
+
+    side_arr = assign_level_side(
+        close_arr,
+        nearest_level_name,
+        nearest_level_price,
+        side_hysteresis_pts=float(side_hysteresis_pts),
+        side_flip_confirm_pts=(
+            float(side_flip_confirm_pts) if side_flip_confirm_pts is not None else None
+        ),
+        trading_day=ohlcv["trading_day"].values if "trading_day" in ohlcv.columns else None,
+    )
+
+    vol_arr = None
+    if use_volatility_scaling and volatility_col in ohlcv.columns:
+        vol_arr = ohlcv[volatility_col].values.astype(np.float64)
+
+    eps = 1e-6
+    for i in range(n):
+        if not near_level_mask[i]:
+            continue
+        level = nearest_level_price[i]
+        price = close_arr[i]
+        side = int(side_arr[i])
+        if side == 0:
+            labels[i] = 2
+            continue
+        trade_dir_arr[i] = side
+
+        end = min(i + 1 + int(forward_bars), n)
+        future_highs = high_arr[i + 1:end]
+        future_lows = low_arr[i + 1:end]
+        future_closes = close_arr[i + 1:end]
+        if len(future_highs) == 0:
+            labels[i] = 2
+            continue
+
+        if side == 1:
+            aligned_mfe = float(np.nanmax(future_highs - price))
+            adverse_move = float(np.nanmax(price - future_lows))
+            terminal_disp = float(future_closes[-1] - price)
+            breakout_level_move = float(np.nanmax(level - future_lows))
+            adverse_ref = max(adverse_move, breakout_level_move)
+        else:
+            aligned_mfe = float(np.nanmax(price - future_lows))
+            adverse_move = float(np.nanmax(future_highs - price))
+            terminal_disp = float(price - future_closes[-1])
+            breakout_level_move = float(np.nanmax(future_highs - level))
+            adverse_ref = max(adverse_move, breakout_level_move)
+
+        rev_thr = float(reversal_pts)
+        brk_thr = float(breakout_pts)
+        if vol_arr is not None:
+            vol = float(vol_arr[i])
+            if np.isfinite(vol) and vol > 0:
+                rev_thr = max(rev_thr, float(reversal_vol_mult) * vol)
+                brk_thr = max(brk_thr, float(breakout_vol_mult) * vol)
+
+        ratio_aligned = (aligned_mfe + eps) / (adverse_ref + eps)
+        ratio_adverse = (adverse_ref + eps) / (aligned_mfe + eps)
+
+        is_pos = (
+            aligned_mfe >= rev_thr
+            and ratio_aligned >= float(excursion_ratio)
+            and terminal_disp >= float(terminal_disp_frac) * rev_thr
+        )
+        is_neg = (
+            adverse_ref >= brk_thr
+            and ratio_adverse >= float(breakout_excursion_ratio)
+            and terminal_disp <= -float(terminal_disp_frac) * brk_thr
+        )
+
+        if is_pos and not is_neg:
+            label = 1
+            if bool(drop_near_threshold_ambiguity):
+                aligned_margin = (aligned_mfe - rev_thr) / max(rev_thr, eps)
+                ratio_margin = ratio_aligned - float(excursion_ratio)
+                terminal_margin = (terminal_disp / max(rev_thr, eps)) - float(terminal_disp_frac)
+                if (
+                    aligned_margin <= float(ambiguity_margin_frac)
+                    or ratio_margin <= float(ambiguity_ratio_buffer)
+                    or terminal_margin <= float(ambiguity_margin_frac)
+                ):
+                    label = 2
+            labels[i] = label
+        elif is_neg and not is_pos:
+            label = 0
+            if bool(drop_near_threshold_ambiguity):
+                adverse_margin = (adverse_ref - brk_thr) / max(brk_thr, eps)
+                ratio_margin = ratio_adverse - float(breakout_excursion_ratio)
+                terminal_margin = ((-terminal_disp) / max(brk_thr, eps)) - float(terminal_disp_frac)
+                if (
+                    adverse_margin <= float(ambiguity_margin_frac)
+                    or ratio_margin <= float(ambiguity_ratio_buffer)
+                    or terminal_margin <= float(ambiguity_margin_frac)
+                ):
+                    label = 2
+            labels[i] = label
+        else:
+            labels[i] = 2
+
+    ohlcv["outcome"] = labels
+    ohlcv["nearest_level_name"] = nearest_level_name
+    ohlcv["nearest_level_price"] = nearest_level_price
+    ohlcv["side"] = side_arr
+    ohlcv["trade_direction"] = trade_dir_arr
+
+    n_rev = int((labels == 1).sum())
+    n_bo = int((labels == 0).sum())
+    n_inc = int((labels == 2).sum())
+    print(f"  Reversal: {n_rev:,} ({100*n_rev/max(n_near,1):.1f}%)")
+    print(f"  Breakout: {n_bo:,} ({100*n_bo/max(n_near,1):.1f}%)")
+    print(f"  Inconclusive: {n_inc:,} ({100*n_inc/max(n_near,1):.1f}%)")
+    return ohlcv
+
+
+def reduce_to_episode_first_samples(
+    samples_df: pd.DataFrame,
+    gap_bars: int = 10,
+) -> pd.DataFrame:
+    """
+    Keep only the first bar of each level-side episode.
+
+    Episodes are grouped by trading_day + nearest_level_name + side and split when
+    bar-index gap exceeds `gap_bars`.
+    """
+    if samples_df.empty:
+        return samples_df
+    gap = max(int(gap_bars), 0)
+    keep_idx: List[int] = []
+
+    grouped = samples_df.groupby(
+        ["trading_day", "nearest_level_name", "side"],
+        sort=False,
+    )
+    for _, g in grouped:
+        idx = np.sort(g.index.to_numpy(dtype=np.int64, copy=False))
+        if idx.size == 0:
+            continue
+        keep_idx.append(int(idx[0]))
+        if idx.size == 1:
+            continue
+        cut = np.where(np.diff(idx) > gap)[0] + 1
+        for c in cut:
+            keep_idx.append(int(idx[c]))
+
+    keep_idx = sorted(set(keep_idx))
+    return samples_df.loc[keep_idx].copy()
+
+
 # ── Step 1: Level-aware feature engineering ──────────────────────────────
 
-def compute_level_encoding_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+def compute_level_encoding_features(
+    ohlcv: pd.DataFrame,
+    tracked_levels: Optional[List[str]] = None,
+    include_extended_episode_features: bool = False,
+) -> Tuple[pd.DataFrame, List[str]]:
     """
     Add ~12 features encoding level identity and quality.
 
@@ -231,9 +865,10 @@ def compute_level_encoding_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, 
     new_cols = []
     n = len(ohlcv)
     nearest = ohlcv['nearest_level_name'].values
+    tracked_levels = tracked_levels or list(BASE_TRACKED_LEVELS)
 
     # 1. One-hot encoding of nearest level type (7 features)
-    for lvl in TRACKED_LEVELS:
+    for lvl in tracked_levels:
         col = f'is_{lvl}'
         ohlcv[col] = (nearest == lvl).astype(np.float32)
         new_cols.append(col)
@@ -263,7 +898,7 @@ def compute_level_encoding_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, 
     ).reset_index()
 
     # Build cumulative lookup: for each (day, level) → trailing rev rate
-    for lvl in TRACKED_LEVELS:
+    for lvl in tracked_levels:
         lvl_stats = daily_stats[daily_stats['nearest_level_name'] == lvl].copy()
         lvl_stats = lvl_stats.set_index('trading_day').reindex(days).fillna(0)
         lvl_stats['cum_rev'] = lvl_stats['n_rev'].cumsum()
@@ -322,6 +957,29 @@ def compute_level_encoding_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, 
             approach_dir[i] = 1.0 if price_change > 0 else -1.0
     ohlcv['approach_dir_vs_level'] = approach_dir
     new_cols.append('approach_dir_vs_level')
+
+    # 6. Intraday episode/reclaim-state features (current-close causal)
+    print("  Computing episode-state features...")
+    from strategies.features.episode_state import (
+        BASE_EPISODE_STATE_FEATURES,
+        EPISODE_STATE_FEATURES,
+        compute_episode_state_features,
+    )
+    ep_df = compute_episode_state_features(
+        ohlcv,
+        level_col='nearest_level_name',
+        side_col='side',
+        trading_day_col='trading_day',
+        density_window_bars=30,
+    )
+    episode_feature_cols = (
+        EPISODE_STATE_FEATURES
+        if include_extended_episode_features else BASE_EPISODE_STATE_FEATURES
+    )
+    for col in episode_feature_cols:
+        if col in ep_df.columns:
+            ohlcv[col] = ep_df[col].values.astype(np.float32)
+            new_cols.append(col)
 
     print(f"  Added {len(new_cols)} level-encoding features")
     return ohlcv, new_cols
@@ -585,8 +1243,8 @@ def evaluate_thresholds(train_result: Dict, ohlcv: pd.DataFrame,
     threshold_results = {}
 
     print(f"\n{'Thresh':>7} {'N pred':>8} {'N trades':>9} {'WR':>7} {'E[PnL]':>8} "
-          f"{'Total PnL':>10} {'Precision':>10}")
-    print("-" * 65)
+          f"{'Total PnL':>10} {'Precision':>10} {'Recall':>8}")
+    print("-" * 75)
 
     for thresh in thresholds:
         pred_mask = all_y_prob >= thresh
@@ -596,7 +1254,9 @@ def evaluate_thresholds(train_result: Dict, ohlcv: pd.DataFrame,
         y_pred = pred_mask.astype(int)
         tp = ((y_pred == 1) & (all_y_true == 1)).sum()
         fp = ((y_pred == 1) & (all_y_true == 0)).sum()
+        fn = ((y_pred == 0) & (all_y_true == 1)).sum()
         precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
 
         # Trading simulation
         n_trades, wr, mean_pnl, total_pnl, pnl_list = simulate_trades(
@@ -605,7 +1265,11 @@ def evaluate_thresholds(train_result: Dict, ohlcv: pd.DataFrame,
 
         threshold_results[thresh] = {
             'n_predicted': int(pred_mask.sum()),
+            'tp': int(tp),
+            'fp': int(fp),
+            'fn': int(fn),
             'precision': precision,
+            'recall': recall,
             'n_trades': n_trades,
             'win_rate': wr,
             'mean_pnl': mean_pnl,
@@ -615,7 +1279,7 @@ def evaluate_thresholds(train_result: Dict, ohlcv: pd.DataFrame,
         }
 
         print(f"{thresh:>7.2f} {pred_mask.sum():>8,} {n_trades:>9,} "
-              f"{wr:>7.1%} {mean_pnl:>8.2f} {total_pnl:>10.1f} {precision:>10.1%}")
+              f"{wr:>7.1%} {mean_pnl:>8.2f} {total_pnl:>10.1f} {precision:>10.1%} {recall:>8.1%}")
 
     return threshold_results
 
@@ -624,7 +1288,8 @@ def evaluate_thresholds(train_result: Dict, ohlcv: pd.DataFrame,
 
 def run_post_analysis(train_result: Dict, threshold_results: Dict,
                       ohlcv: pd.DataFrame, samples_df: pd.DataFrame,
-                      level_encoding_cols: List[str]):
+                      level_encoding_cols: List[str],
+                      tracked_levels: Optional[List[str]] = None):
     """Feature importance, per-level breakdown, baselines, fold stability."""
 
     print("\n" + "=" * 70)
@@ -658,7 +1323,8 @@ def run_post_analysis(train_result: Dict, threshold_results: Dict,
     print(f"{'Level':<15} {'N trades':>9} {'WR':>7} {'E[PnL]':>8} {'Total PnL':>10}")
     print("-" * 55)
 
-    for lvl in TRACKED_LEVELS:
+    tracked_levels = tracked_levels or list(BASE_TRACKED_LEVELS)
+    for lvl in tracked_levels:
         lvl_mask = ohlcv.loc[pred_indices, 'nearest_level_name'].values == lvl
         lvl_indices = pred_indices[lvl_mask]
         if len(lvl_indices) == 0:
@@ -702,7 +1368,8 @@ def run_post_analysis(train_result: Dict, threshold_results: Dict,
 
 def save_figures(train_result: Dict, threshold_results: Dict,
                  ohlcv: pd.DataFrame, samples_df: pd.DataFrame,
-                 level_encoding_cols: List[str]):
+                 level_encoding_cols: List[str],
+                 tracked_levels: Optional[List[str]] = None):
     """Save all analysis figures."""
     try:
         import matplotlib
@@ -762,7 +1429,8 @@ def save_figures(train_result: Dict, threshold_results: Dict,
     level_wr_baseline = {}
     near_mask = samples_df['outcome'].isin([0, 1])
 
-    for lvl in TRACKED_LEVELS:
+    tracked_levels = tracked_levels or list(BASE_TRACKED_LEVELS)
+    for lvl in tracked_levels:
         # Model
         lvl_pred_mask = ohlcv.loc[pred_indices, 'nearest_level_name'].values == lvl
         lvl_pred = pred_indices[lvl_pred_mask]
@@ -782,10 +1450,10 @@ def save_figures(train_result: Dict, threshold_results: Dict,
             level_wr_baseline[lvl] = np.nan
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    x = np.arange(len(TRACKED_LEVELS))
+    x = np.arange(len(tracked_levels))
     width = 0.35
-    model_wrs = [level_wr_model.get(l, 0) for l in TRACKED_LEVELS]
-    base_wrs = [level_wr_baseline.get(l, 0) for l in TRACKED_LEVELS]
+    model_wrs = [level_wr_model.get(l, 0) for l in tracked_levels]
+    base_wrs = [level_wr_baseline.get(l, 0) for l in tracked_levels]
     ax.bar(x - width/2, base_wrs, width, label='Baseline (all bars)', color='#95a5a6')
     ax.bar(x + width/2, model_wrs, width, label=f'Model (t={best_thresh:.2f})', color='#e74c3c')
     ax.axhline(y=0.5, color='black', linestyle=':', alpha=0.5)
@@ -793,7 +1461,7 @@ def save_figures(train_result: Dict, threshold_results: Dict,
     ax.set_ylabel('Win Rate')
     ax.set_title('Win Rate by Level Type: Model vs Baseline')
     ax.set_xticks(x)
-    ax.set_xticklabels(TRACKED_LEVELS, rotation=30, ha='right')
+    ax.set_xticklabels(tracked_levels, rotation=30, ha='right')
     ax.legend()
     ax.set_ylim(0, 1.0)
     plt.tight_layout()
@@ -856,7 +1524,18 @@ def save_figures(train_result: Dict, threshold_results: Dict,
 def save_model(samples_df: pd.DataFrame, feature_cols: List[str],
                ohlcv: pd.DataFrame, train_result: Dict,
                model_dir: str = 'models/reversal_phase3',
-               threshold: float = 0.50) -> None:
+               threshold: float = 0.50,
+               same_day_bidask_only: bool = False,
+               tracked_levels: Optional[List[str]] = None,
+               label_side_hysteresis_pts: float = 0.0,
+               label_side_flip_confirm_pts: Optional[float] = None,
+               label_drop_ambiguous_direction: bool = False,
+               label_ambiguity_bar_tolerance: int = 2,
+               labeling_scheme: str = "execution",
+               label_forward_bars: int = 45,
+               label_reversal_pts: float = 6.0,
+               label_breakout_pts: float = 4.0,
+               extra_metadata: Optional[Dict[str, object]] = None) -> None:
     """
     Train a final model on all data and save artifacts for realtime use.
 
@@ -915,18 +1594,31 @@ def save_model(samples_df: pd.DataFrame, feature_cols: List[str],
     # Save metadata
     metadata = {
         'feature_cols': feature_cols,
-        'tracked_levels': list(TRACKED_LEVELS),
+        'tracked_levels': list(tracked_levels or BASE_TRACKED_LEVELS),
         'threshold': threshold,
+        'same_day_bidask_only': bool(same_day_bidask_only),
         'stop_pts': STOP_PTS,
         'target_pts': TARGET_PTS,
         'max_bars': MAX_BARS,
         'proximity_pts': 5.0,
+        'label_side_hysteresis_pts': float(label_side_hysteresis_pts),
+        'label_side_flip_confirm_pts': (
+            float(label_side_flip_confirm_pts) if label_side_flip_confirm_pts is not None else None
+        ),
+        'label_drop_ambiguous_direction': bool(label_drop_ambiguous_direction),
+        'label_ambiguity_bar_tolerance': int(label_ambiguity_bar_tolerance),
+        'labeling_scheme': str(labeling_scheme),
+        'label_forward_bars': int(label_forward_bars),
+        'label_reversal_pts': float(label_reversal_pts),
+        'label_breakout_pts': float(label_breakout_pts),
         'n_features': len(feature_cols),
         'n_train_samples': int(len(X_tr)),
         'n_val_samples': int(len(X_val)),
         'best_iteration': int(model.best_iteration),
         'oos_auc': float(train_result['overall_auc']),
     }
+    if extra_metadata:
+        metadata.update(extra_metadata)
     metadata_path = os.path.join(model_dir, 'metadata.json')
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
@@ -950,6 +1642,153 @@ def save_model(samples_df: pd.DataFrame, feature_cols: List[str],
           f"({len(test_indices):,} samples)")
 
 
+def _compute_probability_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = 10,
+) -> Dict[str, float]:
+    y_true = np.asarray(y_true).astype(np.float64)
+    y_prob = np.asarray(y_prob).astype(np.float64)
+    if y_true.size == 0:
+        return {
+            "pos_mean_prob": 0.0,
+            "neg_mean_prob": 0.0,
+            "prob_cohens_d": 0.0,
+            "brier": 0.0,
+            "ece": 0.0,
+            "pr_auc": 0.0,
+        }
+
+    pos = y_prob[y_true >= 0.5]
+    neg = y_prob[y_true < 0.5]
+    pos_mean = float(np.mean(pos)) if pos.size else 0.0
+    neg_mean = float(np.mean(neg)) if neg.size else 0.0
+
+    if pos.size > 1 and neg.size > 1:
+        pos_var = float(np.var(pos, ddof=1))
+        neg_var = float(np.var(neg, ddof=1))
+        pooled = np.sqrt(max((pos_var + neg_var) / 2.0, 1e-12))
+        d = float((pos_mean - neg_mean) / pooled)
+    else:
+        d = 0.0
+
+    brier = float(np.mean((y_prob - y_true) ** 2))
+    try:
+        from sklearn.metrics import average_precision_score
+        pr_auc = float(average_precision_score(y_true, y_prob))
+    except Exception:
+        pr_auc = 0.0
+
+    bins = np.linspace(0.0, 1.0, int(n_bins) + 1)
+    ece = 0.0
+    for b0, b1 in zip(bins[:-1], bins[1:]):
+        if b1 >= 1.0:
+            m = (y_prob >= b0) & (y_prob <= b1)
+        else:
+            m = (y_prob >= b0) & (y_prob < b1)
+        if not np.any(m):
+            continue
+        conf = float(np.mean(y_prob[m]))
+        acc = float(np.mean(y_true[m]))
+        ece += float(np.mean(m)) * abs(acc - conf)
+
+    return {
+        "pos_mean_prob": pos_mean,
+        "neg_mean_prob": neg_mean,
+        "prob_cohens_d": d,
+        "brier": brier,
+        "ece": float(ece),
+        "pr_auc": pr_auc,
+    }
+
+
+def _build_summary_payload(
+    args: argparse.Namespace,
+    tracked_levels: List[str],
+    all_feature_cols: List[str],
+    train_result: Dict,
+    threshold_results: Dict,
+) -> Dict:
+    threshold_rows = {}
+    for thr, row in threshold_results.items():
+        threshold_rows[f"{float(thr):.2f}"] = {
+            "n_predicted": int(row["n_predicted"]),
+            "tp": int(row["tp"]),
+            "fp": int(row["fp"]),
+            "fn": int(row["fn"]),
+            "precision": float(row["precision"]),
+            "recall": float(row["recall"]),
+            "n_trades": int(row["n_trades"]),
+            "win_rate": float(row["win_rate"]),
+            "mean_pnl": float(row["mean_pnl"]),
+            "total_pnl": float(row["total_pnl"]),
+        }
+
+    by_total = max(threshold_results.keys(), key=lambda t: threshold_results[t]["total_pnl"])
+    by_mean = max(
+        threshold_results.keys(),
+        key=lambda t: threshold_results[t]["mean_pnl"],
+    )
+    top_features = sorted(
+        train_result["feature_importance"].items(),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )[:20]
+
+    return {
+        "config": {
+            "data": args.data,
+            "n_folds": int(args.n_folds),
+            "min_train_days": int(args.min_train_days),
+            "same_day_bidask_only": bool(args.same_day_bidask_only),
+            "include_ib_relative_levels": bool(args.include_ib_relative_levels),
+            "ib_relative_mode": str(args.ib_relative_mode),
+            "tracked_levels": list(tracked_levels),
+            "n_tracked_levels": int(len(tracked_levels)),
+            "n_features": int(len(all_feature_cols)),
+            "labeling_scheme": str(args.labeling_scheme),
+            "sample_mode": str(args.sample_mode),
+            "sample_episode_gap_bars": int(args.sample_episode_gap_bars),
+            "label_forward_bars": (
+                int(args.label_forward_bars) if args.label_forward_bars is not None else None
+            ),
+            "label_reversal_pts": (
+                float(args.label_reversal_pts) if args.label_reversal_pts is not None else None
+            ),
+            "label_breakout_pts": (
+                float(args.label_breakout_pts) if args.label_breakout_pts is not None else None
+            ),
+            "label_excursion_ratio": float(args.label_excursion_ratio),
+            "label_breakout_excursion_ratio": float(args.label_breakout_excursion_ratio),
+            "label_terminal_disp_frac": float(args.label_terminal_disp_frac),
+            "label_use_volatility_scaling": bool(args.label_use_volatility_scaling),
+            "label_volatility_col": str(args.label_volatility_col),
+            "label_reversal_vol_mult": float(args.label_reversal_vol_mult),
+            "label_breakout_vol_mult": float(args.label_breakout_vol_mult),
+            "include_intraday_regime_features": bool(args.include_intraday_regime_features),
+            "include_extended_episode_features": bool(args.include_extended_episode_features),
+            "label_drop_near_threshold_ambiguity": bool(args.label_drop_near_threshold_ambiguity),
+            "label_ambiguity_margin_frac": float(args.label_ambiguity_margin_frac),
+            "label_ambiguity_ratio_buffer": float(args.label_ambiguity_ratio_buffer),
+        },
+        "overall_auc": float(train_result["overall_auc"]),
+        "probability_metrics": _compute_probability_metrics(
+            y_true=train_result["all_y_true"],
+            y_prob=train_result["all_y_prob"],
+        ),
+        "best_threshold_by_total_pnl": {
+            "threshold": float(by_total),
+            **threshold_rows[f"{float(by_total):.2f}"],
+        },
+        "best_threshold_by_mean_pnl": {
+            "threshold": float(by_mean),
+            **threshold_rows[f"{float(by_mean):.2f}"],
+        },
+        "threshold_results": threshold_rows,
+        "top_features": [{"feature": str(k), "importance": float(v)} for k, v in top_features],
+    }
+
+
 # ── Main ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -962,26 +1801,277 @@ def main():
                         help='Save model artifacts to models/reversal_phase3/')
     parser.add_argument('--model-dir', default='models/reversal_phase3',
                         help='Directory to save model artifacts')
+    parser.add_argument(
+        '--same-day-bidask-only',
+        action='store_true',
+        help='Use same-trading-day-only normalization for bid/ask-derived delta features.',
+    )
+    parser.add_argument(
+        '--include-intraday-regime-features',
+        action='store_true',
+        help='Add causal intraday regime/context features (opening drive, gap, session trend).',
+    )
+    parser.add_argument(
+        '--include-extended-episode-features',
+        action='store_true',
+        help='Add richer causal episode-state features for repeated level tests.',
+    )
+    parser.add_argument(
+        '--include-ib-relative-levels',
+        action='store_true',
+        help='Promote IB-relative references into tracked levels for labeling/encoding.',
+    )
+    parser.add_argument(
+        '--ib-relative-mode',
+        choices=['core', 'full'],
+        default='core',
+        help='IB-relative level set when --include-ib-relative-levels is enabled.',
+    )
+    parser.add_argument(
+        '--tracked-levels',
+        nargs='*',
+        default=None,
+        help='Explicit tracked levels override (space separated).',
+    )
+    parser.add_argument(
+        '--labeling-scheme',
+        choices=['execution', 'structural', 'major_move'],
+        default='execution',
+        help='Labeling target: execution, structural, or excursion-quality major_move.',
+    )
+    parser.add_argument(
+        '--label-forward-bars',
+        type=int,
+        default=None,
+        help='Forward bars for label outcome (default: 45 execution, 60 structural).',
+    )
+    parser.add_argument(
+        '--label-reversal-pts',
+        type=float,
+        default=None,
+        help='Reversal move threshold in points (default: 6 execution, 12 structural).',
+    )
+    parser.add_argument(
+        '--label-breakout-pts',
+        type=float,
+        default=None,
+        help='Breakout move threshold in points (default: 4 execution, 6 structural).',
+    )
+    parser.add_argument(
+        '--label-side-hysteresis',
+        type=float,
+        default=0.0,
+        help='Deadband (points) for sticky per-level side assignment during labeling.',
+    )
+    parser.add_argument(
+        '--label-side-flip-confirm',
+        type=float,
+        default=None,
+        help='Optional stronger opposite-side cross (points) required before label side flips.',
+    )
+    parser.add_argument(
+        '--label-excursion-ratio',
+        type=float,
+        default=1.4,
+        help='For major_move labeling: min aligned/adverse excursion ratio for reversal label.',
+    )
+    parser.add_argument(
+        '--label-breakout-excursion-ratio',
+        type=float,
+        default=1.2,
+        help='For major_move labeling: min adverse/aligned excursion ratio for breakout label.',
+    )
+    parser.add_argument(
+        '--label-terminal-disp-frac',
+        type=float,
+        default=0.20,
+        help='For major_move labeling: required terminal displacement as fraction of threshold.',
+    )
+    parser.add_argument(
+        '--label-use-volatility-scaling',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='For major_move labeling: scale min excursion thresholds by volatility floor.',
+    )
+    parser.add_argument(
+        '--label-volatility-col',
+        default='daily_atr_14',
+        help='Volatility column used for major_move threshold scaling.',
+    )
+    parser.add_argument(
+        '--label-reversal-vol-mult',
+        type=float,
+        default=0.10,
+        help='For major_move labeling: reversal threshold floor = max(pts, vol_mult * volatility_col).',
+    )
+    parser.add_argument(
+        '--label-breakout-vol-mult',
+        type=float,
+        default=0.08,
+        help='For major_move labeling: breakout threshold floor = max(pts, vol_mult * volatility_col).',
+    )
+    parser.add_argument(
+        '--label-drop-ambiguous-direction',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Mark bars as inconclusive when opposite-side interpretation gives conflicting outcome.',
+    )
+    parser.add_argument(
+        '--label-ambiguity-bar-tolerance',
+        type=int,
+        default=2,
+        help='When dropping ambiguous labels, require opposite outcome within this many bars of assigned outcome.',
+    )
+    parser.add_argument(
+        '--label-drop-near-threshold-ambiguity',
+        action='store_true',
+        help='For major_move labeling: drop labels that only barely clear the excursion/terminal thresholds.',
+    )
+    parser.add_argument(
+        '--label-ambiguity-margin-frac',
+        type=float,
+        default=0.10,
+        help='For major_move ambiguity filtering: minimum excess over move/terminal threshold, as fraction of threshold.',
+    )
+    parser.add_argument(
+        '--label-ambiguity-ratio-buffer',
+        type=float,
+        default=0.10,
+        help='For major_move ambiguity filtering: minimum excess over excursion-ratio threshold.',
+    )
+    parser.add_argument(
+        '--output-json',
+        default='',
+        help='Optional path to save compact training summary JSON.',
+    )
+    parser.add_argument(
+        '--sample-mode',
+        choices=['all', 'episode_first'],
+        default='all',
+        help='Sample selection mode before model training.',
+    )
+    parser.add_argument(
+        '--sample-episode-gap-bars',
+        type=int,
+        default=10,
+        help='When sample-mode=episode_first, gap (bars) that starts a new episode.',
+    )
     args = parser.parse_args()
 
     t0 = time.time()
+    tracked_levels = resolve_tracked_levels(
+        tracked_levels_override=args.tracked_levels,
+        include_ib_relative=bool(args.include_ib_relative_levels),
+        ib_relative_mode=str(args.ib_relative_mode),
+    )
+    print(f"Tracked levels ({len(tracked_levels)}): {tracked_levels}")
 
     # ── Load data and compute features ──
     ohlcv = load_data(args.data)
-    ohlcv = compute_levels(ohlcv)
-    ohlcv, feature_cols = compute_all_features(ohlcv)
+    ohlcv = compute_levels(ohlcv, tracked_levels=tracked_levels)
+    ohlcv, feature_cols = compute_all_features(
+        ohlcv,
+        same_day_bidask_only=args.same_day_bidask_only,
+        include_intraday_regime_features=bool(args.include_intraday_regime_features),
+    )
 
     # ── Label reversals/breakouts ──
-    ohlcv = label_reversals_breakouts(ohlcv)
+    if args.labeling_scheme == 'structural':
+        label_forward_bars = int(args.label_forward_bars) if args.label_forward_bars is not None else 60
+        label_reversal_pts = float(args.label_reversal_pts) if args.label_reversal_pts is not None else 12.0
+        label_breakout_pts = float(args.label_breakout_pts) if args.label_breakout_pts is not None else 6.0
+        label_side_hysteresis = float(args.label_side_hysteresis) if args.label_side_hysteresis > 0 else 0.5
+        ohlcv = label_reversals_breakouts_structural(
+            ohlcv,
+            tracked_levels=tracked_levels,
+            proximity_pts=5.0,
+            forward_bars=label_forward_bars,
+            reversal_pts=label_reversal_pts,
+            breakout_pts=label_breakout_pts,
+            side_hysteresis_pts=label_side_hysteresis,
+            side_flip_confirm_pts=(
+                float(args.label_side_flip_confirm)
+                if args.label_side_flip_confirm is not None else None
+            ),
+            drop_ambiguous_direction=(
+                bool(args.label_drop_ambiguous_direction)
+                if args.label_drop_ambiguous_direction is not None else False
+            ),
+            ambiguity_bar_tolerance=int(args.label_ambiguity_bar_tolerance),
+        )
+    elif args.labeling_scheme == 'major_move':
+        label_forward_bars = int(args.label_forward_bars) if args.label_forward_bars is not None else 60
+        label_reversal_pts = float(args.label_reversal_pts) if args.label_reversal_pts is not None else 6.0
+        label_breakout_pts = float(args.label_breakout_pts) if args.label_breakout_pts is not None else 4.0
+        label_side_hysteresis = float(args.label_side_hysteresis) if args.label_side_hysteresis > 0 else 0.5
+        ohlcv = label_reversals_major_move(
+            ohlcv,
+            tracked_levels=tracked_levels,
+            proximity_pts=5.0,
+            forward_bars=label_forward_bars,
+            reversal_pts=label_reversal_pts,
+            breakout_pts=label_breakout_pts,
+            side_hysteresis_pts=label_side_hysteresis,
+            side_flip_confirm_pts=(
+                float(args.label_side_flip_confirm)
+                if args.label_side_flip_confirm is not None else None
+            ),
+            excursion_ratio=float(args.label_excursion_ratio),
+            breakout_excursion_ratio=float(args.label_breakout_excursion_ratio),
+            terminal_disp_frac=float(args.label_terminal_disp_frac),
+            use_volatility_scaling=bool(args.label_use_volatility_scaling),
+            volatility_col=str(args.label_volatility_col),
+            reversal_vol_mult=float(args.label_reversal_vol_mult),
+            breakout_vol_mult=float(args.label_breakout_vol_mult),
+            drop_near_threshold_ambiguity=bool(args.label_drop_near_threshold_ambiguity),
+            ambiguity_margin_frac=float(args.label_ambiguity_margin_frac),
+            ambiguity_ratio_buffer=float(args.label_ambiguity_ratio_buffer),
+        )
+    else:
+        label_forward_bars = int(args.label_forward_bars) if args.label_forward_bars is not None else 45
+        label_reversal_pts = float(args.label_reversal_pts) if args.label_reversal_pts is not None else 6.0
+        label_breakout_pts = float(args.label_breakout_pts) if args.label_breakout_pts is not None else 4.0
+        label_side_hysteresis = float(args.label_side_hysteresis)
+        ohlcv = label_reversals_breakouts(
+            ohlcv,
+            tracked_levels=tracked_levels,
+            forward_bars=label_forward_bars,
+            reversal_pts=label_reversal_pts,
+            breakout_pts=label_breakout_pts,
+            side_hysteresis_pts=label_side_hysteresis,
+            side_flip_confirm_pts=(
+                float(args.label_side_flip_confirm)
+                if args.label_side_flip_confirm is not None else None
+            ),
+            drop_ambiguous_direction=(
+                bool(args.label_drop_ambiguous_direction)
+                if args.label_drop_ambiguous_direction is not None else False
+            ),
+            ambiguity_bar_tolerance=int(args.label_ambiguity_bar_tolerance),
+        )
 
     # ── Add level-encoding features ──
-    ohlcv, level_encoding_cols = compute_level_encoding_features(ohlcv)
+    ohlcv, level_encoding_cols = compute_level_encoding_features(
+        ohlcv,
+        tracked_levels=tracked_levels,
+        include_extended_episode_features=bool(args.include_extended_episode_features),
+    )
     all_feature_cols = feature_cols + level_encoding_cols
     all_feature_cols = list(dict.fromkeys(all_feature_cols))
 
     # ── Filter to reversal/breakout samples only ──
     samples_mask = ohlcv['outcome'].isin([0, 1])
     samples_df = ohlcv.loc[samples_mask].copy()
+    if args.sample_mode == 'episode_first':
+        before = len(samples_df)
+        samples_df = reduce_to_episode_first_samples(
+            samples_df,
+            gap_bars=int(args.sample_episode_gap_bars),
+        )
+        print(
+            f"Episode-first sample reduction: {before:,} -> {len(samples_df):,} "
+            f"({100*len(samples_df)/max(before,1):.1f}% kept)"
+        )
     print(f"\nTraining samples: {len(samples_df):,} "
           f"(reversal={( samples_df['outcome']==1).sum():,}, "
           f"breakout={(samples_df['outcome']==0).sum():,})")
@@ -998,17 +2088,53 @@ def main():
 
     # ── Save model ──
     if args.save_model:
+        extra_md = {
+            "sample_mode": str(args.sample_mode),
+            "sample_episode_gap_bars": int(args.sample_episode_gap_bars),
+            "label_excursion_ratio": float(args.label_excursion_ratio),
+            "label_breakout_excursion_ratio": float(args.label_breakout_excursion_ratio),
+            "label_terminal_disp_frac": float(args.label_terminal_disp_frac),
+            "label_use_volatility_scaling": bool(args.label_use_volatility_scaling),
+            "label_volatility_col": str(args.label_volatility_col),
+            "label_reversal_vol_mult": float(args.label_reversal_vol_mult),
+            "label_breakout_vol_mult": float(args.label_breakout_vol_mult),
+            "include_intraday_regime_features": bool(args.include_intraday_regime_features),
+            "include_extended_episode_features": bool(args.include_extended_episode_features),
+            "label_drop_near_threshold_ambiguity": bool(args.label_drop_near_threshold_ambiguity),
+            "label_ambiguity_margin_frac": float(args.label_ambiguity_margin_frac),
+            "label_ambiguity_ratio_buffer": float(args.label_ambiguity_ratio_buffer),
+        }
         save_model(samples_df, all_feature_cols, ohlcv, train_result,
-                   model_dir=args.model_dir)
+                   model_dir=args.model_dir,
+                   same_day_bidask_only=args.same_day_bidask_only,
+                   tracked_levels=tracked_levels,
+                   label_side_hysteresis_pts=float(label_side_hysteresis),
+                   label_side_flip_confirm_pts=(
+                       float(args.label_side_flip_confirm)
+                       if args.label_side_flip_confirm is not None else None
+                   ),
+                   label_drop_ambiguous_direction=(
+                       bool(args.label_drop_ambiguous_direction)
+                       if args.label_drop_ambiguous_direction is not None
+                       else False
+                   ),
+                   label_ambiguity_bar_tolerance=int(args.label_ambiguity_bar_tolerance),
+                   labeling_scheme=str(args.labeling_scheme),
+                   label_forward_bars=int(label_forward_bars),
+                   label_reversal_pts=float(label_reversal_pts),
+                   label_breakout_pts=float(label_breakout_pts),
+                   extra_metadata=extra_md)
 
     # ── Post-analysis ──
     run_post_analysis(train_result, threshold_results, ohlcv, samples_df,
-                      level_encoding_cols)
+                      level_encoding_cols,
+                      tracked_levels=tracked_levels)
 
     # ── Save figures ──
     if not args.skip_plots:
         save_figures(train_result, threshold_results, ohlcv, samples_df,
-                     level_encoding_cols)
+                     level_encoding_cols,
+                     tracked_levels=tracked_levels)
 
     # ── Summary ──
     best_thresh = max(threshold_results.keys(),
@@ -1025,6 +2151,17 @@ def main():
     print(f"  E[PnL/trade]:       {best['mean_pnl']:+.2f} pts")
     print(f"  Total PnL:          {best['total_pnl']:+.1f} pts")
     print(f"  Precision:          {best['precision']:.1%}")
+    print(f"  Recall:             {best['recall']:.1%}")
+    prob_metrics = _compute_probability_metrics(
+        y_true=train_result["all_y_true"],
+        y_prob=train_result["all_y_prob"],
+    )
+    print(
+        f"  Prob sep (d):       {prob_metrics['prob_cohens_d']:+.3f} "
+        f"(pos_mean={prob_metrics['pos_mean_prob']:.3f}, "
+        f"neg_mean={prob_metrics['neg_mean_prob']:.3f})"
+    )
+    print(f"  Calibration:        Brier={prob_metrics['brier']:.4f}, ECE={prob_metrics['ece']:.4f}")
     print(f"\nTotal time: {time.time()-t0:.0f}s")
 
     # Success criteria check
@@ -1040,6 +2177,22 @@ def main():
     level_in_top10 = [f for f in top10_names if f in level_encoding_cols]
     fi_pass = len(level_in_top10) > 0
     print(f"  Level features in top 10: {'PASS' if fi_pass else 'FAIL'} ({level_in_top10})")
+
+    if args.output_json:
+        payload = _build_summary_payload(
+            args=args,
+            tracked_levels=tracked_levels,
+            all_feature_cols=all_feature_cols,
+            train_result=train_result,
+            threshold_results=threshold_results,
+        )
+        out_path = args.output_json
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"Saved summary JSON: {out_path}")
 
 
 if __name__ == '__main__':

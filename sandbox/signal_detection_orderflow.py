@@ -40,7 +40,7 @@ FIGURE_DIR = "sandbox/figures/signal_detection_orderflow"
 DATA_PATH = "raw_data/es_min_3y_clean_td_gamma.csv"
 
 from strategies.labeling.reversal_zones import TRACKED_LEVELS
-from sandbox.explore_sec_data import (
+from strategies.data.sec_features import (
     load_cached_features,
     ORDERFLOW_FEATURE_COLS,
 )

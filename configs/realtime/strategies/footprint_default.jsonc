@@ -1,0 +1,9 @@
+{
+  "model_dir": "models/footprint_bundle",
+  "pred_threshold": 0.55,
+  "proximity_pts": 5.0,
+  "sec_window_sec": 900,
+  "historical_csv_path": "raw_data/schwab/es_minute_history.csv",
+  "warmup_days": 60,
+  "device": "auto"
+}

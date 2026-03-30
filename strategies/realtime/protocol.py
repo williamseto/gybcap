@@ -1,6 +1,7 @@
 """Strategy protocol and adapter for real-time trading."""
 
 from dataclasses import dataclass, field
+import logging
 from typing import Dict, Any, List, Optional, Protocol, Set, Tuple, runtime_checkable
 import pandas as pd
 import numpy as np
@@ -8,6 +9,8 @@ import xgboost as xgb
 
 from strategies.core.types import Direction, TriggerEvent, TradeSignal
 from strategies.core.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,8 +85,18 @@ class BatchStrategyAdapter:
         # XGBoost model for filtering
         self._model: Optional[xgb.XGBClassifier] = None
         if model_path:
-            self._model = xgb.XGBClassifier()
-            self._model.load_model(model_path)
+            try:
+                self._model = xgb.XGBClassifier()
+                self._model.load_model(model_path)
+            except Exception as e:
+                logger.warning(
+                    "Failed to load model for strategy=%s path=%s. "
+                    "Proceeding without model filter. error=%s",
+                    self._name,
+                    model_path,
+                    e,
+                )
+                self._model = None
 
         # Track emitted signals for dedup: set of (level_name, direction, trigger_ts)
         self._emitted: Set[Tuple[str, str, pd.Timestamp]] = set()

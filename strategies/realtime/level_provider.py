@@ -17,6 +17,7 @@ except ImportError:
     HAS_TALIB = False
 
 from strategies.realtime.data_source import DataSource
+from strategies.realtime.orderflow_columns import normalize_orderflow_columns
 
 # Feature columns produced by compute_bar_stats
 FEAT_COLS = [
@@ -60,6 +61,7 @@ class DayPriceLevelProvider:
     @staticmethod
     def compute_bar_stats(group: pd.DataFrame) -> pd.DataFrame:
         """Compute intraday bar statistics on 1-min bars (datetime-indexed, LA tz)."""
+        group = normalize_orderflow_columns(group, copy=False)
 
         rth_open_hr = 6
         rth_close_hr = 13
@@ -81,11 +83,14 @@ class DayPriceLevelProvider:
         else:
             group['rsi'] = 50.0
 
-        # Overnight hi/lo
-        ovn_hi = group.loc[group['ovn'] == 1, 'high'].max()
-        ovn_lo = group.loc[group['ovn'] == 1, 'low'].min()
-        group['ovn_hi'] = ovn_hi
-        group['ovn_lo'] = ovn_lo
+        # Overnight hi/lo (strictly causal running levels).
+        ovn_mask = group['ovn'] == 1
+        if ovn_mask.any():
+            group['ovn_hi'] = group['high'].where(ovn_mask).cummax().ffill()
+            group['ovn_lo'] = group['low'].where(ovn_mask).cummin().ffill()
+        else:
+            group['ovn_hi'] = np.nan
+            group['ovn_lo'] = np.nan
 
         # VWAP
         avg_price = (group['open'] + group['high'] + group['low'] + group['close']) / 4
@@ -109,8 +114,8 @@ class DayPriceLevelProvider:
         group['close_z20'] = (group['close'] - sma20) / std20
 
         # Overnight z-scores
-        group['ovn_lo_z'] = (group['close'] - ovn_lo) / vwap_std
-        group['ovn_hi_z'] = (ovn_hi - group['close']) / vwap_std
+        group['ovn_lo_z'] = (group['close'] - group['ovn_lo']) / vwap_std
+        group['ovn_hi_z'] = (group['ovn_hi'] - group['close']) / vwap_std
 
         # Initial balance
         ib_df = group.between_time('6:30', '7:30')
@@ -131,15 +136,23 @@ class DayPriceLevelProvider:
         group.loc[rth_after_ib_idx, 'ib_lo'] = ib_lo
         group.loc[rth_after_ib_idx, 'ib_hi'] = ib_hi
 
-        # RTH hi/lo (cumulative after IB)
+        # RTH high/low:
+        # - Track cumulative extremes from RTH open (6:30) for causality.
+        # - Expose these levels only after opening range completes (7:00+).
+        rth_session_idx = group.between_time('6:30', '12:59').index
+        rth_after_or_idx = group.between_time('7:00', '12:59').index
         group['rth_lo'] = 0.0
         group['rth_hi'] = 0.0
-        group.loc[rth_after_ib_idx, 'rth_lo'] = group.loc[rth_after_ib_idx, 'low'].cummin()
-        group.loc[rth_after_ib_idx, 'rth_hi'] = group.loc[rth_after_ib_idx, 'high'].cummax()
+        if len(rth_session_idx) > 0 and len(rth_after_or_idx) > 0:
+            rth_running_lo = group.loc[rth_session_idx, 'low'].cummin()
+            rth_running_hi = group.loc[rth_session_idx, 'high'].cummax()
+            group.loc[rth_after_or_idx, 'rth_lo'] = rth_running_lo.reindex(rth_after_or_idx).values
+            group.loc[rth_after_or_idx, 'rth_hi'] = rth_running_hi.reindex(rth_after_or_idx).values
 
         # Volume z-score
-        vol_mean = group['volume'].rolling(window=20, center=True, min_periods=1).mean()
-        vol_std = group['volume'].rolling(window=20, center=True, min_periods=1).std().add(1e-6)
+        # Causal rolling stats: do not include future bars.
+        vol_mean = group['volume'].rolling(window=20, center=False, min_periods=1).mean()
+        vol_std = group['volume'].rolling(window=20, center=False, min_periods=1).std().add(1e-6)
         group['vol_z'] = (group['volume'] - vol_mean) / vol_std
 
         # ADX
@@ -149,14 +162,19 @@ class DayPriceLevelProvider:
             group['adx'] = 0.0
 
         # Order flow imbalance z-score
-        if 'buys' in group.columns and 'sells' in group.columns:
-            ofi_pct = (group['buys'] - group['sells']) / (group['buys'] + group['sells'])
+        if 'askvolume' in group.columns and 'bidvolume' in group.columns:
+            ofi_pct = (
+                (group['askvolume'] - group['bidvolume'])
+                / (group['askvolume'] + group['bidvolume'])
+            )
             window = 60
             ofi_pct_series = ofi_pct.fillna(0)
-            ofi_z = (
-                ofi_pct_series - ofi_pct_series.rolling(window).mean()
-            ) / ofi_pct_series.rolling(window).std()
-            group['ofi_z'] = ofi_z
+            ofi_roll_mean = ofi_pct_series.rolling(window=window, min_periods=window).mean()
+            ofi_roll_std = (
+                ofi_pct_series.rolling(window=window, min_periods=window).std().replace(0.0, np.nan)
+            )
+            ofi_z = (ofi_pct_series - ofi_roll_mean) / (ofi_roll_std + 1e-6)
+            group['ofi_z'] = ofi_z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         else:
             group['ofi_z'] = 0.0
 
@@ -175,24 +193,36 @@ class DayPriceLevelProvider:
         Resample 1-min bars to *t_samp* and attach price-level features.
 
         Args:
-            ohlcv_1m: 1-minute bars (datetime-indexed, LA tz) with OHLCV + buys/sells.
+            ohlcv_1m: 1-minute bars (datetime-indexed, LA tz) with OHLCV +
+                canonical bid/ask volumes.
             t_samp: Resample period (e.g. '5Min', '15Min').
 
         Returns:
             Resampled bars with prev-day levels + intraday features.
         """
-        ohlcv_feat = self.compute_bar_stats(ohlcv_1m.copy())
+        ohlcv_norm = normalize_orderflow_columns(
+            ohlcv_1m.copy(),
+            copy=False,
+        )
+        ohlcv_feat = self.compute_bar_stats(ohlcv_norm.copy())
 
-        bars = ohlcv_1m.resample(t_samp).agg({
-            'price': 'last',
-            'buys': 'sum',
-            'sells': 'sum',
-            'volume': 'sum',
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-        })
+        agg_map = {
+            "price": "last",
+            "volume": "sum",
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+        }
+        for col in ("bidvolume", "askvolume"):
+            if col in ohlcv_norm.columns:
+                agg_map[col] = "sum"
+
+        bars = ohlcv_norm.resample(t_samp).agg(agg_map)
+        bars = normalize_orderflow_columns(
+            bars,
+            copy=False,
+        )
 
         # Attach previous-day levels
         for col, val in self.prev_day_levels.items():

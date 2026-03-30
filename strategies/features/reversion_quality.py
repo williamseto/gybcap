@@ -51,7 +51,8 @@ class ReversionQualityProvider(BaseFeatureProvider):
         self,
         level_cols: Optional[List[str]] = None,
         lookback_touches: int = 50,
-        touch_threshold_pct: float = 0.001
+        touch_threshold_pct: float = 0.001,
+        same_day_bidask_only: bool = False,
     ):
         """
         Initialize provider.
@@ -60,11 +61,15 @@ class ReversionQualityProvider(BaseFeatureProvider):
             level_cols: Price level columns to check for touches
             lookback_touches: Bars to look back for touch counting
             touch_threshold_pct: Threshold for considering a level "touched"
+            same_day_bidask_only: If True, reset bid/ask-derived rolling signals
+                at trading-day boundaries so features only use same-session
+                overnight+intraday flow.
         """
         super().__init__()
         self.level_cols = level_cols or ['vwap', 'ovn_lo', 'ovn_hi', 'rth_lo', 'rth_hi']
         self.lookback_touches = lookback_touches
         self.touch_threshold_pct = touch_threshold_pct
+        self.same_day_bidask_only = same_day_bidask_only
 
     @property
     def name(self) -> str:
@@ -378,13 +383,28 @@ class ReversionQualityProvider(BaseFeatureProvider):
             close_pos = (close_arr - low_arr) / bar_range
             delta = (close_pos - 0.5) * ohlcv['volume'].values.astype(np.float64)
 
-        delta_series = pd.Series(delta)
-        cum_delta_10 = delta_series.rolling(window=10, min_periods=1).sum()
-        cum_delta_mean = cum_delta_10.rolling(window=50, min_periods=1).mean()
-        cum_delta_std = cum_delta_10.rolling(window=50, min_periods=1).std().replace(0, 1)
-        result['approach_cum_delta_z'] = np.clip(
-            ((cum_delta_10 - cum_delta_mean) / cum_delta_std).fillna(0).values, -5, 5
-        )
+        if self.same_day_bidask_only and 'trading_day' in ohlcv.columns:
+            # Causal within-day normalization: do not let prior-day order-flow
+            # statistics leak into current-day z-scores.
+            z = np.zeros(len(ohlcv), dtype=np.float64)
+            day_to_pos = ohlcv.groupby('trading_day').indices
+            for pos_idx in day_to_pos.values():
+                pos = np.asarray(pos_idx, dtype=np.int64)
+                d = pd.Series(delta[pos])
+                cum_delta_10 = d.rolling(window=10, min_periods=1).sum()
+                cum_delta_mean = cum_delta_10.rolling(window=50, min_periods=1).mean()
+                cum_delta_std = cum_delta_10.rolling(window=50, min_periods=1).std().replace(0, 1).fillna(1)
+                z_day = ((cum_delta_10 - cum_delta_mean) / cum_delta_std).fillna(0).values
+                z[pos] = np.clip(z_day, -5, 5)
+            result['approach_cum_delta_z'] = z
+        else:
+            delta_series = pd.Series(delta)
+            cum_delta_10 = delta_series.rolling(window=10, min_periods=1).sum()
+            cum_delta_mean = cum_delta_10.rolling(window=50, min_periods=1).mean()
+            cum_delta_std = cum_delta_10.rolling(window=50, min_periods=1).std().replace(0, 1)
+            result['approach_cum_delta_z'] = np.clip(
+                ((cum_delta_10 - cum_delta_mean) / cum_delta_std).fillna(0).values, -5, 5
+            )
 
         return result
 

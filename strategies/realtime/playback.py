@@ -2,7 +2,7 @@
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List
 
 from strategies.realtime.config import EngineConfig, PlaybackConfig
@@ -93,13 +93,7 @@ class PlaybackRunner:
 
             # Initialize engine for this day
             engine.initialize(day_start_ts)
-
-            # Step through the day in 1-minute increments
-            step = 60
-            sim_ts = day_start_ts + step
-            while sim_ts <= day_end_ts:
-                engine.update(sim_ts)
-                sim_ts += step
+            engine.replay_to(day_end_ts, step_sec=60, fast_forward=False)
 
             bars_per_day[day] = len(engine.min_df)
             n_signals = len(collector.day_signals.get(day, []))
@@ -107,13 +101,7 @@ class PlaybackRunner:
                 "  %s: %d bars, %d signals", day, bars_per_day[day], n_signals,
             )
 
-            # Reset engine state for next day
-            engine.min_df = engine.min_df.iloc[0:0]
-            engine.last_ts = None
-            engine.raw_deque.clear()
-            for strategy in engine.strategies:
-                if hasattr(strategy, '_emitted'):
-                    strategy._emitted.clear()
+            engine.reset_day_state()
 
         elapsed = time.time() - t0
 

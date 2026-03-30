@@ -2,6 +2,8 @@
 
 import pandas as pd
 
+from strategies.realtime.orderflow_columns import normalize_orderflow_columns
+
 
 class BarAggregator:
     """Converts raw tick/second data into 1-minute OHLCV bars."""
@@ -12,13 +14,18 @@ class BarAggregator:
         Build 1-minute bars from second-level tick data.
 
         Args:
-            sec_df: DataFrame with columns [timestamp, price, volume, buys, sells].
+            sec_df: DataFrame with columns [timestamp, price, volume] plus
+                canonical orderflow columns (`bidvolume`, `askvolume`).
                     A ``dt`` column will be created from ``timestamp``.
 
         Returns:
             DataFrame indexed by minute (LA timezone) with OHLCV columns.
         """
-        df = sec_df.copy()
+        df = normalize_orderflow_columns(
+            sec_df,
+            copy=True,
+        )
+
         df['dt'] = (
             pd.to_datetime(df['timestamp'], unit='s', utc=True)
             .dt.tz_convert('America/Los_Angeles')
@@ -27,14 +34,17 @@ class BarAggregator:
 
         ohlc = df['price'].resample('1Min').ohlc().ffill()
 
-        agg_dict = {
-            'price': 'mean',
-            'buys': 'sum',
-            'sells': 'sum',
-            'volume': 'sum',
-        }
+        agg_dict = {"price": "mean", "volume": "sum"}
+        for col in ("bidvolume", "askvolume"):
+            if col in df.columns:
+                agg_dict[col] = "sum"
         min_df = df.resample('1Min').agg(agg_dict).bfill()
         min_df = min_df.join(ohlc)
+
+        min_df = normalize_orderflow_columns(
+            min_df,
+            copy=False,
+        )
 
         return min_df
 

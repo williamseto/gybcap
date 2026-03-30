@@ -93,11 +93,18 @@ class PriceLevelProvider(BaseFeatureProvider):
         else:
             group["rsi"] = 50.0  # Placeholder
 
-        # Overnight high/low
-        ovn_hi = group[group['ovn'] == 1]['high'].max() if 'ovn' in group.columns else np.nan
-        ovn_lo = group[group['ovn'] == 1]['low'].min() if 'ovn' in group.columns else np.nan
-        group['ovn_hi'] = ovn_hi
-        group['ovn_lo'] = ovn_lo
+        # Overnight high/low (strictly causal running levels).
+        if 'ovn' in group.columns:
+            ovn_mask = group['ovn'] == 1
+            if ovn_mask.any():
+                group['ovn_hi'] = group['high'].where(ovn_mask).cummax().ffill()
+                group['ovn_lo'] = group['low'].where(ovn_mask).cummin().ffill()
+            else:
+                group['ovn_hi'] = np.nan
+                group['ovn_lo'] = np.nan
+        else:
+            group['ovn_hi'] = np.nan
+            group['ovn_lo'] = np.nan
 
         # VWAP
         avg_price = (group["open"] + group["high"] + group["low"] + group["close"]) / 4
@@ -118,8 +125,8 @@ class PriceLevelProvider(BaseFeatureProvider):
         group['close_z20'] = (group['close'] - sma20) / std20
 
         # Overnight z-scores
-        group['ovn_lo_z'] = (group['close'] - ovn_lo) / vwap_std
-        group['ovn_hi_z'] = (ovn_hi - group['close']) / vwap_std
+        group['ovn_lo_z'] = (group['close'] - group['ovn_lo']) / vwap_std
+        group['ovn_hi_z'] = (group['ovn_hi'] - group['close']) / vwap_std
 
         # Initial balance and RTH levels
         if 'dt' in group.columns:
@@ -162,11 +169,18 @@ class PriceLevelProvider(BaseFeatureProvider):
             time_df.loc[rth_after_ib_idx, 'ib_lo'] = ib_lo
             time_df.loc[rth_after_ib_idx, 'ib_hi'] = ib_hi
 
-            # RTH high/low (cumulative after IB)
+            # RTH high/low:
+            # - Track cumulative extremes from RTH open (6:30) for causality.
+            # - Expose these levels only after opening range completes (7:00+).
+            rth_session_idx = time_df.between_time('6:30', '12:59').index
+            rth_after_or_idx = time_df.between_time('7:00', '12:59').index
             time_df['rth_lo'] = 0.0
             time_df['rth_hi'] = 0.0
-            time_df.loc[rth_after_ib_idx, 'rth_lo'] = time_df.loc[rth_after_ib_idx, 'low'].cummin()
-            time_df.loc[rth_after_ib_idx, 'rth_hi'] = time_df.loc[rth_after_ib_idx, 'high'].cummax()
+            if len(rth_session_idx) > 0 and len(rth_after_or_idx) > 0:
+                rth_running_lo = time_df.loc[rth_session_idx, 'low'].cummin()
+                rth_running_hi = time_df.loc[rth_session_idx, 'high'].cummax()
+                time_df.loc[rth_after_or_idx, 'rth_lo'] = rth_running_lo.reindex(rth_after_or_idx).values
+                time_df.loc[rth_after_or_idx, 'rth_hi'] = rth_running_hi.reindex(rth_after_or_idx).values
 
             # Map results back to original integer-indexed group
             for col in ['ib_lo_z', 'ib_hi_z', 'ib_lo', 'ib_hi', 'rth_lo', 'rth_hi']:
@@ -179,9 +193,9 @@ class PriceLevelProvider(BaseFeatureProvider):
             group['rth_lo'] = 0.0
             group['rth_hi'] = 0.0
 
-        # Volume z-score
-        vol_mean = group['volume'].rolling(window=20, center=True, min_periods=1).mean()
-        vol_std = group['volume'].rolling(window=20, center=True, min_periods=1).std().add(1e-6)
+        # Volume z-score (causal: only current/past bars)
+        vol_mean = group['volume'].rolling(window=20, min_periods=1).mean()
+        vol_std = group['volume'].rolling(window=20, min_periods=1).std().add(1e-6)
         group['vol_z'] = (group['volume'] - vol_mean) / vol_std
 
         # ADX
@@ -199,10 +213,12 @@ class PriceLevelProvider(BaseFeatureProvider):
             )
             window = 60
             ofi_pct_series = ofi_pct.fillna(0)
-            ofi_z = (
-                ofi_pct_series - ofi_pct_series.rolling(window).mean()
-            ) / ofi_pct_series.rolling(window).std()
-            group['ofi_z'] = ofi_z
+            ofi_roll_mean = ofi_pct_series.rolling(window=window, min_periods=window).mean()
+            ofi_roll_std = (
+                ofi_pct_series.rolling(window=window, min_periods=window).std().replace(0.0, np.nan)
+            )
+            ofi_z = (ofi_pct_series - ofi_roll_mean) / (ofi_roll_std + 1e-6)
+            group['ofi_z'] = ofi_z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         else:
             group['ofi_z'] = 0.0
 

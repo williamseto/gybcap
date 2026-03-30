@@ -15,11 +15,18 @@ Features include:
 from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
-from scipy.stats import entropy as scipy_entropy
 from scipy.signal import find_peaks
 
 from strategies.features.base import BaseFeatureProvider
 from strategies.features.registry import FeatureRegistry
+
+
+def _safe_entropy(p: np.ndarray) -> float:
+    """Fast entropy for already-normalized probability vectors."""
+    if p.size == 0:
+        return 0.0
+    p_clip = np.clip(p, 1e-10, 1.0)
+    return float(-(p_clip * np.log(p_clip)).sum())
 
 
 def _build_cumulative_vbp(
@@ -349,7 +356,7 @@ class VolumeMicrostructureProvider(BaseFeatureProvider):
             local_vbp_norm = local_vbp / local_vbp.sum()
             # Avoid log(0)
             local_vbp_norm = np.clip(local_vbp_norm, 1e-10, 1.0)
-            features['vol_profile_entropy'] = float(scipy_entropy(local_vbp_norm))
+            features['vol_profile_entropy'] = _safe_entropy(local_vbp_norm)
         else:
             features['vol_profile_entropy'] = 0.0
 
@@ -525,9 +532,20 @@ class VolumeMicrostructureProvider(BaseFeatureProvider):
         day_df: pd.DataFrame,
         levels: np.ndarray,
     ) -> Dict[str, np.ndarray]:
-        """Compute composite VP features for one day."""
+        """Compute composite VP features for one day.
+
+        Note: nearest_hvn_dist / nearest_lvn_dist are computed in the per-bar
+        vectorized session path so they are strictly same-day causal.
+        """
         T = len(day_df)
-        features = {f: np.zeros(T, dtype=np.float64) for f in self.COMPOSITE_VP_FEATURES}
+        features = {
+            'composite_vp_density_3d': np.zeros(T, dtype=np.float64),
+            'composite_vp_density_5d': np.zeros(T, dtype=np.float64),
+            'level_is_hvn_3d': np.zeros(T, dtype=np.float64),
+            'level_is_lvn_3d': np.zeros(T, dtype=np.float64),
+            'vp_valley_depth': np.zeros(T, dtype=np.float64),
+            'composite_poc_dist': np.zeros(T, dtype=np.float64),
+        }
 
         day_idx_in_list = sorted_days.index(day) if day in sorted_days else -1
         if day_idx_in_list < 0:
@@ -539,15 +557,14 @@ class VolumeMicrostructureProvider(BaseFeatureProvider):
 
         comp_3d = self._build_composite_vbp(prior_3d, 0)
         comp_5d = self._build_composite_vbp(prior_5d, 0)
-
-        # Session VP: use current day's final VBP
-        if day in self._day_vbp_cache:
-            session_data = self._day_vbp_cache[day]
-            session_vbp = session_data['cum_vbp'][-1]
-            session_bins = session_data['bin_centers']
-            session_hvn_lvn = self._find_hvn_lvn(session_vbp, session_bins)
-        else:
-            session_hvn_lvn = None
+        p70_3d = 0.0
+        p20_3d = 0.0
+        if comp_3d is not None:
+            vbp_3d = comp_3d['vbp']
+            nonzero = vbp_3d[vbp_3d > 0]
+            if nonzero.size > 0:
+                p70_3d = float(np.percentile(nonzero, 70))
+                p20_3d = float(np.percentile(nonzero, 20))
 
         for t in range(T):
             level = levels[t]
@@ -566,10 +583,8 @@ class VolumeMicrostructureProvider(BaseFeatureProvider):
                 features['composite_vp_density_3d'][t] = vbp_3d[bin_idx] / max(total_3d, 1e-6)
 
                 # HVN/LVN classification
-                p70 = np.percentile(vbp_3d[vbp_3d > 0], 70) if (vbp_3d > 0).any() else 0
-                p20 = np.percentile(vbp_3d[vbp_3d > 0], 20) if (vbp_3d > 0).any() else 0
-                features['level_is_hvn_3d'][t] = float(vbp_3d[bin_idx] >= p70)
-                features['level_is_lvn_3d'][t] = float(vbp_3d[bin_idx] <= p20)
+                features['level_is_hvn_3d'][t] = float(vbp_3d[bin_idx] >= p70_3d)
+                features['level_is_lvn_3d'][t] = float(vbp_3d[bin_idx] <= p20_3d)
 
                 # POC distance
                 features['composite_poc_dist'][t] = abs(comp_3d['poc_price'] - level)
@@ -582,19 +597,6 @@ class VolumeMicrostructureProvider(BaseFeatureProvider):
                 bin_idx_5d = np.searchsorted(bins_5d, level)
                 bin_idx_5d = min(max(bin_idx_5d, 0), len(vbp_5d) - 1)
                 features['composite_vp_density_5d'][t] = vbp_5d[bin_idx_5d] / max(total_5d, 1e-6)
-
-            # Session LVN/HVN distances
-            if session_hvn_lvn is not None:
-                hvn_prices = session_hvn_lvn['hvn_prices']
-                lvn_prices = session_hvn_lvn['lvn_prices']
-
-                if hvn_prices:
-                    dists = [abs(level - p) for p in hvn_prices]
-                    features['nearest_hvn_dist'][t] = min(dists)
-
-                if lvn_prices:
-                    dists = [abs(level - p) for p in lvn_prices]
-                    features['nearest_lvn_dist'][t] = min(dists)
 
             # VP valley depth: min/max volume ratio between price and level
             if day in self._day_vbp_cache:
@@ -698,7 +700,6 @@ class VolumeMicrostructureProvider(BaseFeatureProvider):
         features = {feat: np.zeros(T, dtype=np.float64) for feat in self.feature_names}
 
         # Pre-compute bin indices for all levels
-        bins = np.concatenate([[bin_centers[0] - self.bin_size], bin_centers + self.bin_size / 2])
         tick_size = 0.25 * self.level_radius_ticks * 4
         lo_indices = np.clip(np.searchsorted(bin_centers, levels - tick_size), 0, n_bins - 1)
         hi_indices = np.clip(np.searchsorted(bin_centers, levels + tick_size) + 1, 0, n_bins)
@@ -745,7 +746,7 @@ class VolumeMicrostructureProvider(BaseFeatureProvider):
                 local_sum = local_vbp.sum()
                 if local_sum > 0:
                     local_vbp_norm = np.clip(local_vbp / local_sum, 1e-10, 1.0)
-                    features['vol_profile_entropy'][t] = float(scipy_entropy(local_vbp_norm))
+                    features['vol_profile_entropy'][t] = _safe_entropy(local_vbp_norm)
 
             # Volume dynamics
             start_idx = max(0, t - self.lookback_bars)
@@ -756,6 +757,30 @@ class VolumeMicrostructureProvider(BaseFeatureProvider):
             # Profile shape
             features['poc_distance'][t] = abs(poc_prices[t] - levels[t])
             features['n_peaks_near_level'][t] = _count_peaks(vbp_at_bar[lo_idx:hi_idx])
+
+            # Session HVN/LVN distances (same-day causal, current profile at bar t)
+            nz_idx = np.flatnonzero(vbp_at_bar > 0)
+            nnz = int(len(nz_idx))
+            if nnz > 0:
+                nz_vals = vbp_at_bar[nz_idx]
+                n_hvn = max(1, int(np.ceil(0.30 * nnz)))
+                n_lvn = max(1, int(np.ceil(0.20 * nnz)))
+
+                if n_hvn >= nnz:
+                    hvn_bins = bin_centers[nz_idx]
+                else:
+                    top_idx = np.argpartition(nz_vals, nnz - n_hvn)[nnz - n_hvn:]
+                    hvn_bins = bin_centers[nz_idx[top_idx]]
+                if len(hvn_bins) > 0:
+                    features['nearest_hvn_dist'][t] = float(np.min(np.abs(hvn_bins - levels[t])))
+
+                if n_lvn >= nnz:
+                    lvn_bins = bin_centers[nz_idx]
+                else:
+                    bot_idx = np.argpartition(nz_vals, n_lvn - 1)[:n_lvn]
+                    lvn_bins = bin_centers[nz_idx[bot_idx]]
+                if len(lvn_bins) > 0:
+                    features['nearest_lvn_dist'][t] = float(np.min(np.abs(lvn_bins - levels[t])))
 
             # Profile skew (simplified)
             if hi_idx > lo_idx + 2:

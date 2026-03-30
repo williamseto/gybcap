@@ -172,7 +172,7 @@ def extract_batch_footprints(
         with open(cache_path, "rb") as f:
             return pickle.load(f)
 
-    from sandbox.explore_sec_data import load_quarter, list_quarter_files
+    from strategies.data.sec_features import load_quarter, list_quarter_files
 
     n_samples = len(sample_bars)
     current_all = np.zeros(
@@ -186,10 +186,11 @@ def extract_batch_footprints(
 
     # Group samples by date for efficient loading
     sample_bars = sample_bars.copy()
-    sample_bars["_date"] = sample_bars["dt"].dt.date
+    sample_bars["sample_pos"] = np.arange(n_samples, dtype=np.int64)
+    sample_bars["date_key"] = pd.to_datetime(sample_bars["dt"]).dt.date
 
     # Build quarter lookup: date → quarter file
-    quarter_files = list_quarter_files()
+    quarter_files = list_quarter_files(sec_data_dir=sec_data_dir)
     date_to_quarter = {}
     for qf in quarter_files:
         # Parse quarter from filename: es_sec_2023q1.csv → (2023, 1)
@@ -209,12 +210,12 @@ def extract_batch_footprints(
             d += datetime.timedelta(days=1)
 
     # Process by quarter to minimize file loading
-    dates = sorted(sample_bars["_date"].unique())
+    dates = sorted(sample_bars["date_key"].unique())
     loaded_quarters = {}  # path → sec_df
 
     n_processed = 0
     for date in dates:
-        date_mask = sample_bars["_date"] == date
+        date_mask = sample_bars["date_key"] == date
         date_samples = sample_bars[date_mask]
 
         if date not in date_to_quarter:
@@ -242,17 +243,11 @@ def extract_batch_footprints(
         if len(day_sec) == 0:
             continue
 
-        for _, sample_row in date_samples.iterrows():
-            idx = sample_row.name  # original index
-            if idx >= n_samples:
-                continue
+        for sample_row in date_samples.itertuples(index=False):
+            pos = int(sample_row.sample_pos)
 
-            bar_minute = sample_row["dt"]
-            if isinstance(bar_minute, str):
-                bar_minute = pd.Timestamp(bar_minute)
-            bar_minute = bar_minute.floor("min")
-
-            level_price = sample_row["nearest_level_price"]
+            bar_minute = pd.Timestamp(sample_row.dt).floor("min")
+            level_price = sample_row.nearest_level_price
             if pd.isna(level_price):
                 continue
 
@@ -266,8 +261,6 @@ def extract_batch_footprints(
 
             # Check if we got meaningful data
             if result["current"].sum() > 0:
-                # Map original index to position in arrays
-                pos = sample_bars.index.get_loc(idx)
                 current_all[pos] = result["current"]
                 context_all[pos] = result["context"]
                 valid_mask[pos] = True

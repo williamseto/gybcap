@@ -30,6 +30,7 @@ from enum import IntEnum
 import pandas as pd
 import numpy as np
 from scipy.stats import linregress
+from strategies.labeling.near_level import assign_level_side, compute_nearest_level_arrays
 
 
 # Canonical list of tracked price levels — import this everywhere
@@ -817,7 +818,6 @@ class ReversalBreakoutLabeler:
     - Includes breakout bars as explicit negative class
     - Evaluates on ALL near-level bars (real base rate)
     """
-
     def __init__(
         self,
         proximity_pts: float = 5.0,
@@ -825,6 +825,11 @@ class ReversalBreakoutLabeler:
         reversal_threshold_pts: float = 6.0,
         breakout_threshold_pts: float = 4.0,
         decay_alpha: float = 0.3,
+        side_hysteresis_pts: float = 0.0,
+        side_flip_confirm_pts: Optional[float] = None,
+        drop_ambiguous_direction: bool = False,
+        ambiguity_bar_tolerance: int = 2,
+        tracked_levels: Optional[List[str]] = None,
     ):
         """
         Args:
@@ -841,6 +846,13 @@ class ReversalBreakoutLabeler:
         self.reversal_threshold_pts = reversal_threshold_pts
         self.breakout_threshold_pts = breakout_threshold_pts
         self.decay_alpha = decay_alpha
+        self.side_hysteresis_pts = max(float(side_hysteresis_pts), 0.0)
+        self.side_flip_confirm_pts = (
+            float(side_flip_confirm_pts) if side_flip_confirm_pts is not None else None
+        )
+        self.drop_ambiguous_direction = bool(drop_ambiguous_direction)
+        self.ambiguity_bar_tolerance = max(int(ambiguity_bar_tolerance), 0)
+        self.tracked_levels = list(tracked_levels) if tracked_levels else list(TRACKED_LEVELS)
 
         self._labeled_data: Optional[pd.DataFrame] = None
         self._stats: Dict[str, Any] = {}
@@ -897,6 +909,31 @@ class ReversalBreakoutLabeler:
         high_arr = result['high'].values.astype(np.float64)
         low_arr = result['low'].values.astype(np.float64)
 
+        level_arrs = {}
+        for lvl_name in self.tracked_levels:
+            if lvl_name in result.columns:
+                level_arrs[str(lvl_name)] = result[lvl_name].values.astype(np.float64)
+
+        nearest_level_raw, nearest_level_price = compute_nearest_level_arrays(
+            close_arr,
+            level_arrs=level_arrs,
+            proximity_pts=float(self.proximity_pts),
+        )
+        near_level = np.isfinite(nearest_level_price)
+        level_distance_arr[near_level] = np.abs(close_arr[near_level] - nearest_level_price[near_level])
+
+        td_vals = result['trading_day'].values if 'trading_day' in result.columns else None
+        side_arr = assign_level_side(
+            close_arr,
+            nearest_level_raw,
+            nearest_level_price,
+            side_hysteresis_pts=self.side_hysteresis_pts,
+            side_flip_confirm_pts=self.side_flip_confirm_pts,
+            trading_day=td_vals,
+        )
+        trade_dir_arr = side_arr.copy()
+        nearest_level_arr[near_level] = np.asarray(nearest_level_raw, dtype=object)[near_level]
+
         for day, day_df in result.groupby('trading_day'):
             day_indices = np.where(
                 (result['trading_day'] == day).values
@@ -905,47 +942,18 @@ class ReversalBreakoutLabeler:
             if n_day < 20:
                 continue
 
-            # Collect level values for this day
-            level_values = {}
-            for lvl_name in TRACKED_LEVELS:
-                if lvl_name in day_df.columns:
-                    vals = day_df[lvl_name].values
-                    valid = vals[~np.isnan(vals)]
-                    if len(valid) > 0 and valid[0] != 0:
-                        level_values[lvl_name] = float(np.median(valid))
-
-            if not level_values:
-                continue
-
             for local_i in range(n_day):
                 gi = day_indices[local_i]
-                c = close_arr[gi]
-
-                # Find nearest level
-                best_name = None
-                best_dist = np.inf
-                best_price = 0.0
-                for lvl_name, lvl_price in level_values.items():
-                    d = abs(c - lvl_price)
-                    if d < best_dist:
-                        best_dist = d
-                        best_name = lvl_name
-                        best_price = lvl_price
-
-                if best_dist > self.proximity_pts:
+                if not near_level[gi]:
                     continue
-
-                near_level[gi] = True
-                nearest_level_arr[gi] = best_name
-                level_distance_arr[gi] = best_dist
-
-                # Side: 1 = above level (support), -1 = below level (resistance)
-                s = 1 if c >= best_price else -1
-                side_arr[gi] = s
-                # Trade direction for reversal: same as side
-                # Above support → reversal = bounce UP → long
-                # Below resistance → reversal = drop DOWN → short
-                trade_dir_arr[gi] = s
+                c = close_arr[gi]
+                s = int(side_arr[gi])
+                if s == 0:
+                    # Fallback for pathological cases.
+                    s = 1 if c >= nearest_level_price[gi] else -1
+                    side_arr[gi] = s
+                    trade_dir_arr[gi] = s
+                best_price = float(nearest_level_price[gi])
 
                 # Forward window (within day)
                 fwd_end = min(local_i + 1 + self.forward_window, n_day)
@@ -981,16 +989,59 @@ class ReversalBreakoutLabeler:
                 first_rev = (rev_hits[0] + 1) if len(rev_hits) > 0 else 9999
                 first_brk = (brk_hits[0] + 1) if len(brk_hits) > 0 else 9999
 
+                assigned = 'inconclusive'
+                assigned_bars = 0
                 if first_rev < first_brk and first_rev < 9999:
-                    outcome_arr[gi] = 'reversal'
-                    bars_to_event_arr[gi] = first_rev
-                    p_reversal[gi] = np.exp(
-                        -self.decay_alpha * first_rev
-                    )
-                    n_reversal += 1
+                    assigned = 'reversal'
+                    assigned_bars = int(first_rev)
                 elif first_brk < first_rev and first_brk < 9999:
+                    assigned = 'breakout'
+                    assigned_bars = int(first_brk)
+
+                if self.drop_ambiguous_direction and assigned in ('reversal', 'breakout'):
+                    if s >= 1:
+                        # Opposite-side assumption (below level).
+                        opp_rev_hits = np.where(
+                            fwd_low <= entry - self.reversal_threshold_pts
+                        )[0]
+                        opp_brk_hits = np.where(
+                            fwd_high >= best_price + self.breakout_threshold_pts
+                        )[0]
+                    else:
+                        # Opposite-side assumption (above level).
+                        opp_rev_hits = np.where(
+                            fwd_high >= entry + self.reversal_threshold_pts
+                        )[0]
+                        opp_brk_hits = np.where(
+                            fwd_low <= best_price - self.breakout_threshold_pts
+                        )[0]
+
+                    opp_first_rev = (opp_rev_hits[0] + 1) if len(opp_rev_hits) > 0 else 9999
+                    opp_first_brk = (opp_brk_hits[0] + 1) if len(opp_brk_hits) > 0 else 9999
+                    if opp_first_rev < opp_first_brk and opp_first_rev < 9999:
+                        opp = 'reversal'
+                        opp_first = int(opp_first_rev)
+                    elif opp_first_brk < opp_first_rev and opp_first_brk < 9999:
+                        opp = 'breakout'
+                        opp_first = int(opp_first_brk)
+                    else:
+                        opp = 'inconclusive'
+                        opp_first = 9999
+                    if (
+                        opp in ('reversal', 'breakout')
+                        and opp != assigned
+                        and opp_first <= (assigned_bars + self.ambiguity_bar_tolerance)
+                    ):
+                        assigned = 'inconclusive'
+
+                if assigned == 'reversal':
+                    outcome_arr[gi] = 'reversal'
+                    bars_to_event_arr[gi] = assigned_bars
+                    p_reversal[gi] = np.exp(-self.decay_alpha * assigned_bars)
+                    n_reversal += 1
+                elif assigned == 'breakout':
                     outcome_arr[gi] = 'breakout'
-                    bars_to_event_arr[gi] = first_brk
+                    bars_to_event_arr[gi] = assigned_bars
                     p_reversal[gi] = 0.0
                     n_breakout += 1
                 else:
@@ -1001,7 +1052,7 @@ class ReversalBreakoutLabeler:
         result['near_level'] = near_level
         result['p_reversal'] = p_reversal
         result['outcome'] = outcome_arr
-        result['nearest_level'] = nearest_level_arr
+        result['nearest_level'] = nearest_level_arr.astype(str)
         result['level_distance'] = level_distance_arr
         result['side'] = side_arr
         result['bars_to_event'] = bars_to_event_arr

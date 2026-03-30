@@ -39,7 +39,10 @@ DATA_PATH = "raw_data/es_min_3y_clean_td_gamma.csv"
 FIGURE_DIR = "sandbox/figures/level_models_orderflow"
 
 from strategies.labeling.reversal_zones import TRACKED_LEVELS
-from sandbox.explore_sec_data import load_cached_features, ORDERFLOW_FEATURE_COLS
+from strategies.data.sec_features import (
+    merge_cached_orderflow_features,
+    ORDERFLOW_FEATURE_COLS,
+)
 
 STOP_PTS = 4.0
 TARGET_PTS = 6.0
@@ -68,12 +71,21 @@ def compute_levels(ohlcv: pd.DataFrame) -> pd.DataFrame:
     feat_df = plp._compute_impl(ohlcv)
 
     level_cols = ["vwap", "ovn_lo", "ovn_hi", "rth_lo", "rth_hi", "ib_lo", "ib_hi"]
-    if "dt" in feat_df.columns:
-        feat_df = feat_df.set_index("dt")
-    ohlcv_dt = ohlcv.set_index("dt") if "dt" in ohlcv.columns else ohlcv
-    for col in level_cols:
-        if col in feat_df.columns:
-            ohlcv[col] = feat_df[col].reindex(ohlcv_dt.index).values
+    if "level_1" in feat_df.columns:
+        feat_by_row = feat_df.set_index("level_1")
+        for col in level_cols:
+            if col in feat_by_row.columns:
+                ohlcv[col] = feat_by_row[col].reindex(ohlcv.index).values
+    else:
+        if "dt" in feat_df.columns:
+            feat_df = feat_df.set_index("dt")
+        ohlcv_dt = ohlcv.set_index("dt") if "dt" in ohlcv.columns else ohlcv
+        for col in level_cols:
+            if col in feat_df.columns:
+                src = feat_df[col]
+                if src.index.has_duplicates:
+                    src = src.groupby(level=0).last()
+                ohlcv[col] = src.reindex(ohlcv_dt.index).values
 
     levels = plp.prev_day_levels(ohlcv)
     ohlcv["prev_high"] = ohlcv["trading_day"].map(levels["prev_high"])
@@ -81,7 +93,10 @@ def compute_levels(ohlcv: pd.DataFrame) -> pd.DataFrame:
     return ohlcv
 
 
-def compute_all_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+def compute_all_features(
+    ohlcv: pd.DataFrame,
+    same_day_bidask_only: bool = False,
+) -> Tuple[pd.DataFrame, List[str]]:
     feature_cols = []
 
     print("\nComputing higher timeframe features...")
@@ -108,7 +123,7 @@ def compute_all_features(ohlcv: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     print("Computing reversion quality features...")
     from strategies.features.reversion_quality import ReversionQualityProvider
 
-    rqp = ReversionQualityProvider()
+    rqp = ReversionQualityProvider(same_day_bidask_only=same_day_bidask_only)
     qual_df = rqp._compute_impl(ohlcv)
     for col in rqp.feature_names:
         if col in qual_df.columns:
@@ -317,6 +332,118 @@ def compute_level_encoding_features(
     ohlcv["approach_dir_vs_level"] = approach_dir
     new_cols.append("approach_dir_vs_level")
 
+    # Intraday episode-state features (strictly causal by construction)
+    from strategies.features.episode_state import (
+        EPISODE_STATE_FEATURES,
+        compute_episode_state_features,
+    )
+    ep_df = compute_episode_state_features(
+        ohlcv,
+        level_col="nearest_level_name",
+        side_col="side",
+        trading_day_col="trading_day",
+        density_window_bars=30,
+    )
+    for col in EPISODE_STATE_FEATURES:
+        if col in ep_df.columns:
+            ohlcv[col] = ep_df[col].values.astype(np.float32)
+            new_cols.append(col)
+
+    # RTH level stability/time features:
+    # if session highs/lows are being reset frequently, those levels are less "firm".
+    rth_hi_age = np.zeros(n, dtype=np.float32)
+    rth_lo_age = np.zeros(n, dtype=np.float32)
+    rth_updates_10 = np.zeros(n, dtype=np.float32)
+    rth_firmness_10 = np.zeros(n, dtype=np.float32)
+
+    if "rth_hi" in ohlcv.columns and "rth_lo" in ohlcv.columns:
+        day_to_idx = ohlcv.groupby("trading_day").indices
+        for day in days:
+            idx = day_to_idx.get(day)
+            if idx is None or len(idx) == 0:
+                continue
+
+            idx_arr = np.asarray(idx, dtype=np.int64)
+            hi_vals = ohlcv.iloc[idx_arr]["rth_hi"].values.astype(np.float64)
+            lo_vals = ohlcv.iloc[idx_arr]["rth_lo"].values.astype(np.float64)
+
+            valid = (hi_vals > 0) & (lo_vals > 0)
+            hi_age_day = np.zeros(len(idx_arr), dtype=np.float32)
+            lo_age_day = np.zeros(len(idx_arr), dtype=np.float32)
+            hi_updates = np.zeros(len(idx_arr), dtype=np.float32)
+            lo_updates = np.zeros(len(idx_arr), dtype=np.float32)
+
+            last_hi = np.nan
+            last_lo = np.nan
+            age_hi = 0.0
+            age_lo = 0.0
+
+            for t in range(len(idx_arr)):
+                if not valid[t]:
+                    continue
+
+                cur_hi = hi_vals[t]
+                cur_lo = lo_vals[t]
+
+                if np.isnan(last_hi):
+                    hi_updates[t] = 1.0
+                    lo_updates[t] = 1.0
+                    age_hi = 0.0
+                    age_lo = 0.0
+                else:
+                    if cur_hi > last_hi + 1e-9:
+                        hi_updates[t] = 1.0
+                        age_hi = 0.0
+                    else:
+                        age_hi += 1.0
+
+                    if cur_lo < last_lo - 1e-9:
+                        lo_updates[t] = 1.0
+                        age_lo = 0.0
+                    else:
+                        age_lo += 1.0
+
+                hi_age_day[t] = age_hi
+                lo_age_day[t] = age_lo
+                last_hi = cur_hi
+                last_lo = cur_lo
+
+            total_updates = hi_updates + lo_updates
+            updates_10 = (
+                pd.Series(total_updates).rolling(window=10, min_periods=1).sum().values
+            )
+            firmness_10 = 1.0 - np.clip(updates_10 / 10.0, 0.0, 1.0)
+
+            rth_hi_age[idx_arr] = hi_age_day
+            rth_lo_age[idx_arr] = lo_age_day
+            rth_updates_10[idx_arr] = updates_10.astype(np.float32)
+            rth_firmness_10[idx_arr] = firmness_10.astype(np.float32)
+
+    ohlcv["rth_hi_age_bars"] = rth_hi_age
+    ohlcv["rth_lo_age_bars"] = rth_lo_age
+    ohlcv["rth_updates_last10"] = rth_updates_10
+    ohlcv["rth_firmness_10"] = rth_firmness_10
+
+    is_rth_hi = nearest == "rth_hi"
+    is_rth_lo = nearest == "rth_lo"
+    ohlcv["rth_level_age"] = np.where(
+        is_rth_hi, rth_hi_age, np.where(is_rth_lo, rth_lo_age, 0.0)
+    ).astype(np.float32)
+    ohlcv["rth_level_firmness"] = np.where(
+        is_rth_hi | is_rth_lo, rth_firmness_10, 0.0
+    ).astype(np.float32)
+
+    new_cols.extend(
+        [
+            "rth_hi_age_bars",
+            "rth_lo_age_bars",
+            "rth_updates_last10",
+            "rth_firmness_10",
+            "rth_level_age",
+            "rth_level_firmness",
+        ]
+    )
+
     print(f"  Added {len(new_cols)} level-encoding features")
     return ohlcv, new_cols
 
@@ -325,27 +452,26 @@ def compute_level_encoding_features(
 
 def merge_orderflow_features(
     ohlcv: pd.DataFrame,
+    add_missing_indicators: bool = False,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """Merge cached per-second order flow features into 1-min data."""
     print("\nLoading cached order flow features...")
-    of_df = load_cached_features()
-
-    of_df = of_df.set_index("minute")
-    ohlcv_dt = ohlcv["dt"]
-
-    of_cols = [c for c in ORDERFLOW_FEATURE_COLS if c in of_df.columns]
-    print(f"  Order flow feature columns: {len(of_cols)}")
-
-    for col in of_cols:
-        ohlcv[col] = of_df[col].reindex(ohlcv_dt.values).values
-
-    n_matched = ohlcv[of_cols[0]].notna().sum()
+    merged, of_cols, stats = merge_cached_orderflow_features(
+        ohlcv,
+        feature_cols=ORDERFLOW_FEATURE_COLS,
+        add_missing_indicators=add_missing_indicators,
+    )
+    n_base = len([c for c in of_cols if not c.endswith("_is_missing")])
+    n_ind = len(of_cols) - n_base
+    print(f"  Order flow feature columns: {n_base}")
+    if n_ind > 0:
+        print(f"  Missingness indicator columns: {n_ind}")
     print(
-        f"  Matched: {n_matched:,} / {len(ohlcv):,} bars "
-        f"({100 * n_matched / len(ohlcv):.1f}%)"
+        f"  Matched: {stats['n_matched_bars']:,} / {stats['n_total_bars']:,} bars "
+        f"({100 * stats['coverage']:.1f}%)"
     )
 
-    return ohlcv, of_cols
+    return merged, of_cols
 
 
 # ── Walk-forward splits ──────────────────────────────────────────────
@@ -867,7 +993,13 @@ def main():
     parser.add_argument("--data", default=DATA_PATH)
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--min-train-days", type=int, default=100)
+    parser.add_argument("--add-missing-indicators", action="store_true")
     parser.add_argument("--skip-plots", action="store_true")
+    parser.add_argument(
+        "--same-day-bidask-only",
+        action="store_true",
+        help="Use same-trading-day-only normalization for bid/ask-derived delta features.",
+    )
     args = parser.parse_args()
 
     t0 = time.time()
@@ -879,7 +1011,10 @@ def main():
     # ── Load data and compute features ──
     ohlcv = load_data(args.data)
     ohlcv = compute_levels(ohlcv)
-    ohlcv, feature_cols = compute_all_features(ohlcv)
+    ohlcv, feature_cols = compute_all_features(
+        ohlcv,
+        same_day_bidask_only=args.same_day_bidask_only,
+    )
 
     # ── Label ──
     ohlcv = label_reversals_breakouts(ohlcv)
@@ -888,7 +1023,9 @@ def main():
     ohlcv, level_encoding_cols = compute_level_encoding_features(ohlcv)
 
     # ── Merge order flow features ──
-    ohlcv, of_cols = merge_orderflow_features(ohlcv)
+    ohlcv, of_cols = merge_orderflow_features(
+        ohlcv, add_missing_indicators=args.add_missing_indicators
+    )
 
     # ── Build feature sets ──
     baseline_cols = feature_cols + level_encoding_cols
