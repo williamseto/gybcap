@@ -23,6 +23,7 @@ from strategies.labeling.near_level import (
     assign_level_side,
     compute_nearest_level_arrays,
 )
+from strategies.reversal.level_utils import level_group
 from strategies.realtime.orderflow_columns import normalize_orderflow_columns
 from strategies.realtime.protocol import RealtimeSignal
 
@@ -114,6 +115,11 @@ class ReversalPredictorStrategy:
         frontier_r_start: int = 600,
         frontier_r_slots: int = 1,
         frontier_cooldown_min: int = 5,
+        frontier_inertia_enabled: bool = False,
+        frontier_inertia_global_minute_gap: int = 0,
+        frontier_inertia_level_group_minute_gap: int = 0,
+        frontier_inertia_override_min_q: Optional[float] = None,
+        frontier_inertia_override_min_q_gap: float = 0.0,
         frontier_diversity_cap: int = 2,
         frontier_high_override_prob: Optional[float] = None,
         frontier_high_override_cap: int = 0,
@@ -127,6 +133,12 @@ class ReversalPredictorStrategy:
         frontier_dynamic_start_minute: int = 390,
         frontier_loss_lock_diff: int = 0,
         frontier_loss_lock_after_nominal_only: bool = True,
+        frontier_early_loss_lock_enabled: bool = False,
+        frontier_early_loss_lock_start_minute: int = 390,
+        frontier_early_loss_lock_end_minute: int = 450,
+        frontier_early_loss_lock_trigger_diff: int = 1,
+        frontier_early_loss_lock_duration_min: int = 45,
+        frontier_early_loss_lock_once_per_day: bool = True,
         frontier_virtual_gate: float = 0.62,
         frontier_virtual_stop_hi: float = 10.0,
         frontier_virtual_target_hi: float = 40.0,
@@ -317,6 +329,21 @@ class ReversalPredictorStrategy:
         self._frontier_r_start = int(frontier_r_start)
         self._frontier_r_slots = max(int(frontier_r_slots), 0)
         self._frontier_cooldown_min = max(int(frontier_cooldown_min), 0)
+        self._frontier_inertia_enabled = bool(frontier_inertia_enabled)
+        self._frontier_inertia_global_minute_gap = max(int(frontier_inertia_global_minute_gap), 0)
+        self._frontier_inertia_level_group_minute_gap = max(
+            int(frontier_inertia_level_group_minute_gap),
+            0,
+        )
+        self._frontier_inertia_override_min_q = (
+            float(frontier_inertia_override_min_q)
+            if frontier_inertia_override_min_q is not None
+            else None
+        )
+        self._frontier_inertia_override_min_q_gap = max(
+            float(frontier_inertia_override_min_q_gap),
+            0.0,
+        )
         self._frontier_diversity_cap = max(int(frontier_diversity_cap), 0)
         self._frontier_high_override_prob = (
             float(frontier_high_override_prob) if frontier_high_override_prob is not None else None
@@ -333,6 +360,17 @@ class ReversalPredictorStrategy:
         self._frontier_dynamic_start_minute = int(frontier_dynamic_start_minute)
         self._frontier_loss_lock_diff = max(int(frontier_loss_lock_diff), 0)
         self._frontier_loss_lock_after_nominal_only = bool(frontier_loss_lock_after_nominal_only)
+        self._frontier_early_loss_lock_enabled = bool(frontier_early_loss_lock_enabled)
+        self._frontier_early_loss_lock_start_minute = int(frontier_early_loss_lock_start_minute)
+        self._frontier_early_loss_lock_end_minute = int(frontier_early_loss_lock_end_minute)
+        self._frontier_early_loss_lock_trigger_diff = max(int(frontier_early_loss_lock_trigger_diff), 1)
+        self._frontier_early_loss_lock_duration_min = max(int(frontier_early_loss_lock_duration_min), 0)
+        self._frontier_early_loss_lock_once_per_day = bool(frontier_early_loss_lock_once_per_day)
+        if self._frontier_early_loss_lock_start_minute > self._frontier_early_loss_lock_end_minute:
+            self._frontier_early_loss_lock_start_minute, self._frontier_early_loss_lock_end_minute = (
+                self._frontier_early_loss_lock_end_minute,
+                self._frontier_early_loss_lock_start_minute,
+            )
         self._frontier_virtual_gate = float(frontier_virtual_gate)
         self._frontier_virtual_gate_default = float(frontier_virtual_gate)
         self._frontier_virtual_stop_hi = max(float(frontier_virtual_stop_hi), 0.0)
@@ -368,9 +406,13 @@ class ReversalPredictorStrategy:
         self._frontier_seq_position: Optional[Dict[str, object]] = None
         self._frontier_router_last_accept_minute = -10_000
         self._frontier_router_side_counts: Dict[str, int] = {}
+        self._frontier_inertia_last_global: Optional[Dict[str, float]] = None
+        self._frontier_inertia_last_by_group: Dict[str, Dict[str, float]] = {}
         self._frontier_router_warned_policy_missing = False
         self._frontier_blend_live_used_today = 0
         self._frontier_blend_q2_used_today = 0
+        self._frontier_early_loss_lock_until_minute = -1
+        self._frontier_early_loss_lock_triggered_today = False
         self._dual_taken_today = 0
         self._dual_high_taken_today = 0
         self._dual_low_taken_today = 0
@@ -467,6 +509,8 @@ class ReversalPredictorStrategy:
             "episode_gating=%s(gap=%d), budget=%d/day, session_budget(rth=%d,ovn=%d), "
             "thresholds(rth=%.2f,ovn=%.2f), policy=%s(mode=%s,ens=%d), "
             "base_prefilter=%s, dual_lane=%s, frontier_router=%s(qsrc=%s,k=%d,unresolved=%s,exec=%s,opp=%s), "
+            "inertia=%s(g=%d,grp=%d,ovr_q=%s,ovr_gap=%.2f), "
+            "early_loss_lock=%s(start=%d,end=%d,diff=%d,dur=%d,once=%s), "
             "same_day_bidask_only=%s, tracked_levels=%d",
             len(self._feature_cols),
             self._pred_threshold,
@@ -492,6 +536,17 @@ class ReversalPredictorStrategy:
             self._frontier_group_unresolved_enabled,
             self._frontier_execution_mode,
             self._frontier_opposite_action,
+            self._frontier_inertia_enabled,
+            self._frontier_inertia_global_minute_gap,
+            self._frontier_inertia_level_group_minute_gap,
+            "off" if self._frontier_inertia_override_min_q is None else f"{self._frontier_inertia_override_min_q:.2f}",
+            self._frontier_inertia_override_min_q_gap,
+            self._frontier_early_loss_lock_enabled,
+            self._frontier_early_loss_lock_start_minute,
+            self._frontier_early_loss_lock_end_minute,
+            self._frontier_early_loss_lock_trigger_diff,
+            self._frontier_early_loss_lock_duration_min,
+            self._frontier_early_loss_lock_once_per_day,
             self._same_day_bidask_only,
             len(self._tracked_levels),
         )
@@ -572,6 +627,8 @@ class ReversalPredictorStrategy:
             g2 = g.sort_values(["minute_of_day", "__src_idx"], ascending=[True, True])
             episode_idx = 0
             last_ts: Optional[pd.Timestamp] = None
+            row_i: List[int] = []
+            feat_rows: List[np.ndarray] = []
             for _, rr in g2.iterrows():
                 i = int(rr["__row_i"])
                 ts = None
@@ -593,18 +650,22 @@ class ReversalPredictorStrategy:
                 )
                 if x is None:
                     continue
-                p = float(self._policy_model.predict_proba(x)[0, 1])
-                if self._policy_ensemble_models:
-                    ens = np.asarray(
-                        [m.predict_proba(x)[0, 1] for m in self._policy_ensemble_models],
-                        dtype=np.float64,
-                    )
-                    if ens.size and self._policy_use_ensemble_mean:
-                        p = float(ens.mean())
-                out[i] = float(p)
+                row_i.append(int(i))
+                feat_rows.append(x.reshape(-1))
                 episode_idx += 1
                 if ts is not None:
                     last_ts = ts
+            if not feat_rows:
+                continue
+            X = np.vstack(feat_rows).astype(np.float32, copy=False)
+            pred = self._policy_model.predict_proba(X)[:, 1].astype(np.float64)
+            if self._policy_ensemble_models and self._policy_use_ensemble_mean:
+                ens_mat = np.vstack(
+                    [m.predict_proba(X)[:, 1].astype(np.float64) for m in self._policy_ensemble_models]
+                )
+                if ens_mat.size:
+                    pred = ens_mat.mean(axis=0)
+            out[np.asarray(row_i, dtype=np.int64)] = pred
         return out
 
     def _compute_batch_qtwohead_scores(
@@ -647,14 +708,13 @@ class ReversalPredictorStrategy:
         if src == "base_prob":
             return base_prob.astype(np.float64, copy=False)
 
-        policy_prob = self._compute_batch_policy_scores(cand, base_prob)
-        q2_prob = self._compute_batch_qtwohead_scores(cand, base_prob)
-
         if src == "policy_prob":
+            policy_prob = self._compute_batch_policy_scores(cand, base_prob)
             out = policy_prob.copy()
             out[~np.isfinite(out)] = base_prob[~np.isfinite(out)]
             return out
         if src == "q_twohead":
+            q2_prob = self._compute_batch_qtwohead_scores(cand, base_prob)
             out = q2_prob.copy()
             out[~np.isfinite(out)] = base_prob[~np.isfinite(out)]
             return out
@@ -673,6 +733,8 @@ class ReversalPredictorStrategy:
             out[~np.isfinite(out)] = base_prob[~np.isfinite(out)]
             return out
         if src == "blend_policy_q2":
+            policy_prob = self._compute_batch_policy_scores(cand, base_prob)
+            q2_prob = self._compute_batch_qtwohead_scores(cand, base_prob)
             minute = pd.to_numeric(cand["minute_of_day"], errors="coerce").fillna(-1).to_numpy(dtype=np.int32, copy=False)
             live_q = policy_prob.copy()
             live_q[~np.isfinite(live_q)] = base_prob[~np.isfinite(live_q)]
@@ -2108,6 +2170,38 @@ class ReversalPredictorStrategy:
         elif float(pnl) < 0.0:
             self._frontier_realized_losses_today += 1
 
+    def _frontier_early_loss_lock_reject_reason(
+        self,
+        *,
+        minute_of_day: int,
+    ) -> Optional[str]:
+        if not self._frontier_early_loss_lock_enabled:
+            return None
+        m = int(minute_of_day)
+        # Active lock window always blocks new accepts.
+        if self._frontier_early_loss_lock_until_minute >= m:
+            return "router_early_loss_lock"
+        # Optionally allow only one trigger per day.
+        if (
+            self._frontier_early_loss_lock_once_per_day
+            and self._frontier_early_loss_lock_triggered_today
+        ):
+            return None
+        if (
+            m < int(self._frontier_early_loss_lock_start_minute)
+            or m > int(self._frontier_early_loss_lock_end_minute)
+        ):
+            return None
+        diff = int(self._frontier_realized_losses_today) - int(self._frontier_realized_wins_today)
+        if diff < int(self._frontier_early_loss_lock_trigger_diff):
+            return None
+        dur = int(self._frontier_early_loss_lock_duration_min)
+        if dur <= 0:
+            return None
+        self._frontier_early_loss_lock_until_minute = min(int(m) + int(dur), 779)
+        self._frontier_early_loss_lock_triggered_today = True
+        return "router_early_loss_lock"
+
     def _frontier_decide_sequential_action(
         self,
         *,
@@ -2208,6 +2302,92 @@ class ReversalPredictorStrategy:
                 return True
         return False
 
+    @staticmethod
+    def _frontier_level_group(level_name: str) -> str:
+        return level_group(level_name)
+
+    def _frontier_inertia_override_ok(
+        self,
+        *,
+        quality_score: float,
+        last_quality: float,
+    ) -> bool:
+        has_override_cfg = (
+            self._frontier_inertia_override_min_q is not None
+            or self._frontier_inertia_override_min_q_gap > 0.0
+        )
+        if not has_override_cfg:
+            return False
+        if (
+            self._frontier_inertia_override_min_q is not None
+            and float(quality_score) < float(self._frontier_inertia_override_min_q)
+        ):
+            return False
+        if self._frontier_inertia_override_min_q_gap > 0.0 and (
+            float(quality_score) - float(last_quality)
+        ) < float(self._frontier_inertia_override_min_q_gap):
+            return False
+        return True
+
+    def _frontier_inertia_reject_reason(
+        self,
+        *,
+        minute_of_day: int,
+        direction: int,
+        level_name: str,
+        quality_score: float,
+    ) -> Optional[str]:
+        if not self._frontier_inertia_enabled:
+            return None
+
+        m = int(minute_of_day)
+        d = int(direction)
+        if d == 0:
+            return None
+
+        if self._frontier_inertia_level_group_minute_gap > 0:
+            group = self._frontier_level_group(level_name)
+            last_group = self._frontier_inertia_last_by_group.get(str(group))
+            if last_group is not None and int(last_group.get("direction", 0)) != d:
+                dt = m - int(last_group.get("minute", -10_000))
+                if dt < int(self._frontier_inertia_level_group_minute_gap):
+                    if not self._frontier_inertia_override_ok(
+                        quality_score=float(quality_score),
+                        last_quality=float(last_group.get("quality", 0.0)),
+                    ):
+                        return "router_inertia_group"
+
+        if self._frontier_inertia_global_minute_gap > 0 and self._frontier_inertia_last_global is not None:
+            last_global = self._frontier_inertia_last_global
+            if int(last_global.get("direction", 0)) != d:
+                dt = m - int(last_global.get("minute", -10_000))
+                if dt < int(self._frontier_inertia_global_minute_gap):
+                    if not self._frontier_inertia_override_ok(
+                        quality_score=float(quality_score),
+                        last_quality=float(last_global.get("quality", 0.0)),
+                    ):
+                        return "router_inertia_global"
+        return None
+
+    def _frontier_inertia_record_accept(
+        self,
+        *,
+        minute_of_day: int,
+        direction: int,
+        level_name: str,
+        quality_score: float,
+    ) -> None:
+        if not self._frontier_inertia_enabled:
+            return
+        rec = {
+            "minute": float(int(minute_of_day)),
+            "direction": float(int(direction)),
+            "quality": float(quality_score),
+        }
+        self._frontier_inertia_last_global = dict(rec)
+        group = self._frontier_level_group(level_name)
+        self._frontier_inertia_last_by_group[str(group)] = dict(rec)
+
     def _frontier_register_virtual_trade(
         self,
         *,
@@ -2261,8 +2441,12 @@ class ReversalPredictorStrategy:
         self._frontier_seq_position = None
         self._frontier_router_last_accept_minute = -10_000
         self._frontier_router_side_counts.clear()
+        self._frontier_inertia_last_global = None
+        self._frontier_inertia_last_by_group.clear()
         self._frontier_blend_live_used_today = 0
         self._frontier_blend_q2_used_today = 0
+        self._frontier_early_loss_lock_until_minute = -1
+        self._frontier_early_loss_lock_triggered_today = False
 
     def _sync_frontier_router_day(self, row: pd.Series) -> None:
         day: Optional[str] = None
@@ -2297,6 +2481,11 @@ class ReversalPredictorStrategy:
         m = int(minute_of_day)
         if m < 390 or m >= 780:
             return False, "router_time"
+        early_loss_lock_reason = self._frontier_early_loss_lock_reject_reason(
+            minute_of_day=int(m)
+        )
+        if early_loss_lock_reason is not None:
+            return False, str(early_loss_lock_reason)
         unresolved = bool(unresolved_block) if unresolved_block is not None else False
         if unresolved_block is None and self._frontier_group_unresolved_enabled:
             unresolved = self._frontier_has_unresolved_trade(
@@ -2315,6 +2504,14 @@ class ReversalPredictorStrategy:
             and self._frontier_router_side_counts.get(key, 0) >= int(self._frontier_diversity_cap)
         ):
             return False, "router_diversity"
+        inertia_reason = self._frontier_inertia_reject_reason(
+            minute_of_day=int(m),
+            direction=int(direction),
+            level_name=str(level_name),
+            quality_score=float(quality_score),
+        )
+        if inertia_reason is not None:
+            return False, str(inertia_reason)
 
         lane: Optional[str] = None
         if self._frontier_router_q_used_today < int(self._frontier_q_slots):
@@ -2399,6 +2596,12 @@ class ReversalPredictorStrategy:
                 )
         self._frontier_router_last_accept_minute = m
         self._frontier_router_side_counts[key] = self._frontier_router_side_counts.get(key, 0) + 1
+        self._frontier_inertia_record_accept(
+            minute_of_day=int(m),
+            direction=int(direction),
+            level_name=str(level_name),
+            quality_score=float(quality_score),
+        )
         return True, lane
 
     def _frontier_blend_q2_accept(
@@ -2419,6 +2622,11 @@ class ReversalPredictorStrategy:
         m = int(minute_of_day)
         if m < 390 or m >= 780:
             return False, "router_time"
+        early_loss_lock_reason = self._frontier_early_loss_lock_reject_reason(
+            minute_of_day=int(m)
+        )
+        if early_loss_lock_reason is not None:
+            return False, str(early_loss_lock_reason)
         if m < int(self._frontier_blend_q2_start) or m >= int(self._frontier_blend_q2_end):
             return False, "router_q2_time"
         if float(quality_score) < float(self._frontier_blend_q2_min_q):
@@ -2445,6 +2653,14 @@ class ReversalPredictorStrategy:
             and self._frontier_router_side_counts.get(key, 0) >= int(self._frontier_diversity_cap)
         ):
             return False, "router_diversity"
+        inertia_reason = self._frontier_inertia_reject_reason(
+            minute_of_day=int(m),
+            direction=int(direction),
+            level_name=str(level_name),
+            quality_score=float(quality_score),
+        )
+        if inertia_reason is not None:
+            return False, str(inertia_reason)
 
         eff_k_total = int(self._frontier_k_total)
         if self._frontier_dynamic_budget_enabled and m >= int(self._frontier_dynamic_start_minute):
@@ -2507,6 +2723,12 @@ class ReversalPredictorStrategy:
                 )
         self._frontier_router_last_accept_minute = m
         self._frontier_router_side_counts[key] = self._frontier_router_side_counts.get(key, 0) + 1
+        self._frontier_inertia_record_accept(
+            minute_of_day=int(m),
+            direction=int(direction),
+            level_name=str(level_name),
+            quality_score=float(quality_score),
+        )
         return True, "q2"
 
     def _build_mfe_feature_row(

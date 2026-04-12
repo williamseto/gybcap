@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,10 +26,11 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from sandbox.analyze_reversal_playback_day import (
     _build_strategy,
-    _load_causal_history,
     _load_day_bars,
     _load_json,
 )
+from strategies.realtime.csv_data_source import CSVDataSource
+from strategies.realtime.data_source import get_session_window_for_trading_day
 
 
 def _parse_csv(raw: str) -> List[str]:
@@ -102,6 +104,10 @@ def _metrics(trades: pd.DataFrame, day_ids: List[str]) -> Dict[str, Any]:
             "mean_pnl_per_day": mean_day,
             "annualized_daily_sharpe": sharpe,
             "profit_factor": None,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "total_pnl": float(day_pnl.sum()),
+            "daily_pnl": {str(k): float(v) for k, v in day_pnl.items()},
             "mean_pnl_per_trade": None,
             "win_rate": None,
             "zero_trade_day_rate": 1.0,
@@ -119,6 +125,10 @@ def _metrics(trades: pd.DataFrame, day_ids: List[str]) -> Dict[str, Any]:
         "mean_pnl_per_day": mean_day,
         "annualized_daily_sharpe": sharpe,
         "profit_factor": (gp / gl) if gl > 1e-9 else None,
+        "gross_profit": float(gp),
+        "gross_loss": float(gl),
+        "total_pnl": float(day_pnl.sum()),
+        "daily_pnl": {str(k): float(v) for k, v in day_pnl.items()},
         "mean_pnl_per_trade": float(trades["pnl"].mean()),
         "win_rate": float((trades["pnl"] > 0.0).mean()),
         "zero_trade_day_rate": float(np.mean(day_pnl.to_numpy() == 0.0)),
@@ -139,13 +149,84 @@ def _contract_from_cfg(cfg: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
+def _signal_diversity(
+    *,
+    bars: pd.DataFrame,
+    events: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    entry_like = [e for e in events if str(e.get("action", "")) in {"entry", "flip"}]
+    n = int(len(entry_like))
+    if n <= 0:
+        return {
+            "n_entry_like_events": 0.0,
+            "unique_levels": 0.0,
+            "level_hhi": 0.0,
+            "long_share": 0.0,
+            "short_share": 0.0,
+            "open_60_share": 0.0,
+            "post_open_60_share": 0.0,
+            "late_morning_120_share": 0.0,
+            "afternoon_150_share": 0.0,
+            "other_share": 0.0,
+        }
+
+    levels = pd.Series([str(e.get("level_name", "")) for e in entry_like], dtype=str)
+    lvc = levels.value_counts()
+    lp = lvc.to_numpy(dtype=np.float64, copy=False) / max(float(lvc.sum()), 1.0)
+    level_hhi = float(np.sum(np.square(lp))) if lp.size else 0.0
+
+    dirs = np.asarray([int(e.get("direction", 0)) for e in entry_like], dtype=np.int8)
+    long_n = int(np.sum(dirs > 0))
+    short_n = int(np.sum(dirs < 0))
+    dden = max(long_n + short_n, 1)
+
+    buckets = {
+        "open_60": 0,
+        "post_open_60": 0,
+        "late_morning_120": 0,
+        "afternoon_150": 0,
+        "other": 0,
+    }
+    for e in entry_like:
+        i = int(e.get("idx", -1))
+        if i < 0 or i >= len(bars):
+            buckets["other"] += 1
+            continue
+        ts = pd.Timestamp(bars.iloc[i]["dt"])
+        minute = int(ts.hour) * 60 + int(ts.minute)
+        if 390 <= minute < 450:
+            buckets["open_60"] += 1
+        elif 450 <= minute < 510:
+            buckets["post_open_60"] += 1
+        elif 510 <= minute < 630:
+            buckets["late_morning_120"] += 1
+        elif 630 <= minute < 780:
+            buckets["afternoon_150"] += 1
+        else:
+            buckets["other"] += 1
+    bden = max(n, 1)
+
+    return {
+        "n_entry_like_events": float(n),
+        "unique_levels": float(levels.nunique()),
+        "level_hhi": float(level_hhi),
+        "long_share": float(long_n / dden),
+        "short_share": float(short_n / dden),
+        "open_60_share": float(buckets["open_60"] / bden),
+        "post_open_60_share": float(buckets["post_open_60"] / bden),
+        "late_morning_120_share": float(buckets["late_morning_120"] / bden),
+        "afternoon_150_share": float(buckets["afternoon_150"] / bden),
+        "other_share": float(buckets["other"] / bden),
+    }
+
+
 def _simulate_day_from_signals(
     *,
     day: str,
     bars: pd.DataFrame,
     signals: List[Any],
     cfg: Dict[str, Any],
-) -> Tuple[pd.DataFrame, Dict[str, int]]:
+) -> Tuple[pd.DataFrame, Dict[str, int], Dict[str, float]]:
     def _norm_ts(ts: Any) -> Optional[pd.Timestamp]:
         t = pd.Timestamp(ts)
         if pd.isna(t):
@@ -160,7 +241,7 @@ def _simulate_day_from_signals(
     b["dt"] = pd.to_datetime(b["dt"], errors="coerce")
     b = b.sort_values("dt").reset_index(drop=True)
     if b.empty:
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {}, {}
 
     close = pd.to_numeric(b["close"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64, copy=False)
     high = pd.to_numeric(b["high"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64, copy=False)
@@ -236,7 +317,7 @@ def _simulate_day_from_signals(
                     "lane": str(ev["lane"]),
                 }
             )
-        return pd.DataFrame(trades), action_counts
+        return pd.DataFrame(trades), action_counts, _signal_diversity(bars=b, events=events)
 
     pos: Optional[Dict[str, Any]] = None
     for ev in events:
@@ -404,7 +485,22 @@ def _simulate_day_from_signals(
                     "lane": str(pos["lane"]),
                 }
             )
-    return pd.DataFrame(trades), action_counts
+    return pd.DataFrame(trades), action_counts, _signal_diversity(bars=b, events=events)
+
+
+def _load_causal_history_cached(
+    *,
+    csv_source_cache: Dict[str, CSVDataSource],
+    csv_path: str,
+    trading_day: str,
+    warmup_days: int,
+) -> pd.DataFrame:
+    src = csv_source_cache.get(str(csv_path))
+    if src is None:
+        src = CSVDataSource(str(csv_path))
+        csv_source_cache[str(csv_path)] = src
+    start_ts, _ = get_session_window_for_trading_day(str(trading_day))
+    return src.fetch_history_bars(start_ts - 1, n_days=int(warmup_days))
 
 
 def main() -> None:
@@ -416,46 +512,121 @@ def main() -> None:
 
     days = _parse_csv(args.days)
     cfg_paths = _parse_csv(args.configs)
+    print(
+        f"[runtime-gate] starting days={len(days)} configs={len(cfg_paths)} output={args.output_json}",
+        flush=True,
+    )
     out: Dict[str, Any] = {"days": days, "configs": cfg_paths, "runs": {}}
 
+    # Cache SQL playback bars once per day across all configs.
+    bars_by_day: Dict[str, pd.DataFrame] = {}
+    day_load_errors: Dict[str, str] = {}
+    for day in days:
+        try:
+            bars_by_day[str(day)] = _load_day_bars(str(day))
+        except Exception as e:  # noqa: BLE001
+            day_load_errors[str(day)] = str(e)
+
+    # Cache causal history by (csv_path, warmup_days, trading_day) across configs.
+    history_cache: Dict[Tuple[str, int, str], Any] = {}
+    csv_source_cache: Dict[str, CSVDataSource] = {}
+
     for cfg_path in cfg_paths:
+        cfg_t0 = time.time()
         raw = _load_json(cfg_path)
         params = dict(raw.get("params", raw))
         history_csv = str(params.get("historical_csv_path", "raw_data/schwab/es_minute_history.csv"))
         warmup_days = int(params.get("warmup_days", 60))
+        print(
+            f"[runtime-gate] config_start path={cfg_path} warmup_days={warmup_days}",
+            flush=True,
+        )
         all_trades: List[pd.DataFrame] = []
         action_totals: Dict[str, int] = {}
+        day_div_rows: List[Dict[str, float]] = []
         day_ok: List[str] = []
         day_errors: Dict[str, str] = {}
 
         for day in days:
+            day = str(day)
+            if day in day_load_errors:
+                day_errors[day] = str(day_load_errors[day])
+                continue
+            bars = bars_by_day.get(day)
+            if bars is None:
+                day_errors[day] = "bars_missing"
+                continue
             try:
+                print(
+                    f"[runtime-gate] day_start config={Path(cfg_path).stem} day={day}",
+                    flush=True,
+                )
                 strategy = _build_strategy(params)
-                hist = _load_causal_history(history_csv, day, warmup_days)
-                strategy.set_historical_context(hist)
-                bars = _load_day_bars(day)
+                hk = (str(history_csv), int(warmup_days), day)
+                if hk not in history_cache:
+                    history_cache[hk] = _load_causal_history_cached(
+                        csv_source_cache=csv_source_cache,
+                        csv_path=str(history_csv),
+                        trading_day=str(day),
+                        warmup_days=int(warmup_days),
+                    )
+                strategy.set_historical_context(history_cache[hk])
                 sigs = strategy.process(bars)
-                tdf, actions = _simulate_day_from_signals(day=day, bars=bars, signals=sigs, cfg=params)
+                tdf, actions, div = _simulate_day_from_signals(day=day, bars=bars, signals=sigs, cfg=params)
                 all_trades.append(tdf)
                 for k, v in actions.items():
                     action_totals[k] = int(action_totals.get(k, 0)) + int(v)
+                if div:
+                    day_div_rows.append(div)
                 day_ok.append(day)
-            except Exception as e:
+                print(
+                    f"[runtime-gate] day_done config={Path(cfg_path).stem} day={day} trades={len(tdf)}",
+                    flush=True,
+                )
+            except Exception as e:  # noqa: BLE001
                 day_errors[day] = str(e)
+                print(
+                    f"[runtime-gate] day_error config={Path(cfg_path).stem} day={day} err={e}",
+                    flush=True,
+                )
 
         trades = pd.concat(all_trades, axis=0, ignore_index=True) if all_trades else pd.DataFrame()
+        div_df = pd.DataFrame(day_div_rows)
+        signal_diversity = {}
+        if not div_df.empty:
+            signal_diversity = {
+                "mean_entry_like_events_per_day": float(div_df["n_entry_like_events"].mean()),
+                "mean_unique_levels_per_day": float(div_df["unique_levels"].mean()),
+                "mean_level_hhi_per_day": float(div_df["level_hhi"].mean()),
+                "mean_long_share": float(div_df["long_share"].mean()),
+                "mean_short_share": float(div_df["short_share"].mean()),
+                "mean_open_60_share": float(div_df["open_60_share"].mean()),
+                "mean_post_open_60_share": float(div_df["post_open_60_share"].mean()),
+                "mean_late_morning_120_share": float(div_df["late_morning_120_share"].mean()),
+                "mean_afternoon_150_share": float(div_df["afternoon_150_share"].mean()),
+                "mean_other_share": float(div_df["other_share"].mean()),
+            }
+
         out["runs"][Path(cfg_path).stem] = {
             "config_path": cfg_path,
             "days_completed": day_ok,
             "days_failed": day_errors,
             "action_counts": action_totals,
             "exec": _metrics(trades, day_ok),
+            "signal_diversity": signal_diversity,
         }
+        print(
+            (
+                f"[runtime-gate] config_done path={cfg_path} "
+                f"ok={len(day_ok)} failed={len(day_errors)} elapsed_sec={time.time() - cfg_t0:.1f}"
+            ),
+            flush=True,
+        )
 
     out_path = Path(args.output_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2, default=str))
-    print(str(out_path))
+    print(f"[runtime-gate] done output={out_path}", flush=True)
 
 
 if __name__ == "__main__":

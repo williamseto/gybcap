@@ -321,6 +321,35 @@ def add_reversal_predictor_args(parser: argparse.ArgumentParser) -> None:
         help="Frontier router cooldown (minutes between accepts).",
     )
     group.add_argument(
+        "--reversal-frontier-inertia-enabled",
+        action="store_true",
+        help="Enable opposite-side inertia gate for frontier accepts.",
+    )
+    group.add_argument(
+        "--reversal-frontier-inertia-global-minute-gap",
+        type=int,
+        default=None,
+        help="Global opposite-side minimum gap in minutes before next accept.",
+    )
+    group.add_argument(
+        "--reversal-frontier-inertia-level-group-minute-gap",
+        type=int,
+        default=None,
+        help="Level-group opposite-side minimum gap in minutes before next accept.",
+    )
+    group.add_argument(
+        "--reversal-frontier-inertia-override-min-q",
+        type=float,
+        default=None,
+        help="Optional absolute quality threshold to override inertia blocks.",
+    )
+    group.add_argument(
+        "--reversal-frontier-inertia-override-min-q-gap",
+        type=float,
+        default=None,
+        help="Optional quality improvement vs last blocked side needed to override inertia.",
+    )
+    group.add_argument(
         "--reversal-frontier-diversity-cap",
         type=int,
         default=None,
@@ -718,6 +747,44 @@ def build_reversal_predictor_config(
                 cfg,
                 "frontier_cooldown_min",
                 5,
+            )
+        ),
+        "frontier_inertia_enabled": bool(
+            _resolve(
+                True if getattr(args, "reversal_frontier_inertia_enabled", False) else None,
+                cfg,
+                "frontier_inertia_enabled",
+                False,
+            )
+        ),
+        "frontier_inertia_global_minute_gap": int(
+            _resolve(
+                getattr(args, "reversal_frontier_inertia_global_minute_gap", None),
+                cfg,
+                "frontier_inertia_global_minute_gap",
+                0,
+            )
+        ),
+        "frontier_inertia_level_group_minute_gap": int(
+            _resolve(
+                getattr(args, "reversal_frontier_inertia_level_group_minute_gap", None),
+                cfg,
+                "frontier_inertia_level_group_minute_gap",
+                0,
+            )
+        ),
+        "frontier_inertia_override_min_q": _resolve(
+            getattr(args, "reversal_frontier_inertia_override_min_q", None),
+            cfg,
+            "frontier_inertia_override_min_q",
+            None,
+        ),
+        "frontier_inertia_override_min_q_gap": float(
+            _resolve(
+                getattr(args, "reversal_frontier_inertia_override_min_q_gap", None),
+                cfg,
+                "frontier_inertia_override_min_q_gap",
+                0.0,
             )
         ),
         "frontier_diversity_cap": int(

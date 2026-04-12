@@ -133,6 +133,21 @@ def _build_strategy(params: Dict[str, Any]) -> ReversalPredictorStrategy:
         frontier_r_start=int(params.get("frontier_r_start", 600)),
         frontier_r_slots=int(params.get("frontier_r_slots", 1)),
         frontier_cooldown_min=int(params.get("frontier_cooldown_min", 5)),
+        frontier_inertia_enabled=bool(params.get("frontier_inertia_enabled", False)),
+        frontier_inertia_global_minute_gap=int(
+            params.get("frontier_inertia_global_minute_gap", 0)
+        ),
+        frontier_inertia_level_group_minute_gap=int(
+            params.get("frontier_inertia_level_group_minute_gap", 0)
+        ),
+        frontier_inertia_override_min_q=(
+            float(params["frontier_inertia_override_min_q"])
+            if params.get("frontier_inertia_override_min_q") is not None
+            else None
+        ),
+        frontier_inertia_override_min_q_gap=float(
+            params.get("frontier_inertia_override_min_q_gap", 0.0)
+        ),
         frontier_diversity_cap=int(params.get("frontier_diversity_cap", 2)),
         frontier_high_override_prob=(
             float(params["frontier_high_override_prob"])
@@ -153,6 +168,24 @@ def _build_strategy(params: Dict[str, Any]) -> ReversalPredictorStrategy:
         frontier_loss_lock_diff=int(params.get("frontier_loss_lock_diff", 0)),
         frontier_loss_lock_after_nominal_only=bool(
             params.get("frontier_loss_lock_after_nominal_only", True)
+        ),
+        frontier_early_loss_lock_enabled=bool(
+            params.get("frontier_early_loss_lock_enabled", False)
+        ),
+        frontier_early_loss_lock_start_minute=int(
+            params.get("frontier_early_loss_lock_start_minute", 390)
+        ),
+        frontier_early_loss_lock_end_minute=int(
+            params.get("frontier_early_loss_lock_end_minute", 450)
+        ),
+        frontier_early_loss_lock_trigger_diff=int(
+            params.get("frontier_early_loss_lock_trigger_diff", 1)
+        ),
+        frontier_early_loss_lock_duration_min=int(
+            params.get("frontier_early_loss_lock_duration_min", 45)
+        ),
+        frontier_early_loss_lock_once_per_day=bool(
+            params.get("frontier_early_loss_lock_once_per_day", True)
         ),
         frontier_virtual_gate=float(params.get("frontier_virtual_gate", 0.62)),
         frontier_virtual_stop_hi=float(params.get("frontier_virtual_stop_hi", 10.0)),

@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from sandbox import train_frontier_qtwohead_models as tf
 from sandbox.analyze_reversal_playback_day import _load_json
+from strategies.reversal.level_utils import level_group as _level_group
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -88,6 +89,11 @@ class RouterCfg:
     r_start: int = 600
     r_slots: int = 2
     cooldown_min: int = 5
+    inertia_enabled: bool = False
+    inertia_global_minute_gap: int = 0
+    inertia_level_group_minute_gap: int = 0
+    inertia_override_min_q: Optional[float] = None
+    inertia_override_min_q_gap: float = 0.0
     diversity_cap: int = 2
     group_unresolved: bool = True
     unresolved_min: int = 10
@@ -96,6 +102,23 @@ class RouterCfg:
     target_hi: float = 40.0
     stop_lo: float = 4.0
     target_lo: float = 8.0
+    # blend_policy_q2 controls
+    blend_live_cap: int = 5
+    blend_live_start: int = 390
+    blend_live_end: int = 780
+    blend_live_min_q: float = 0.0
+    blend_live_flatten_min_q: float = 0.66
+    blend_q2_cap: int = 2
+    blend_q2_start: int = 450
+    blend_q2_end: int = 780
+    blend_q2_min_q: float = 0.16
+    blend_q2_flatten_min_q: float = 0.16
+    early_loss_lock_enabled: bool = False
+    early_loss_lock_start_minute: int = 390
+    early_loss_lock_end_minute: int = 450
+    early_loss_lock_trigger_diff: int = 1
+    early_loss_lock_duration_min: int = 45
+    early_loss_lock_once_per_day: bool = True
 
 
 @dataclass
@@ -219,6 +242,11 @@ def _load_live_router_cfg(path: str) -> Dict[str, Any]:
 
 
 def _router_cfg_from_live(live_cfg: Dict[str, Any]) -> RouterCfg:
+    inertia_override_raw = (
+        _safe_float(live_cfg.get("frontier_inertia_override_min_q"), np.nan)
+        if live_cfg.get("frontier_inertia_override_min_q") is not None
+        else np.nan
+    )
     return RouterCfg(
         quality_source=str(live_cfg.get("frontier_quality_source", "q_twohead")),
         k_total=_safe_int(live_cfg.get("frontier_k_total", 6), 6),
@@ -231,6 +259,22 @@ def _router_cfg_from_live(live_cfg: Dict[str, Any]) -> RouterCfg:
         r_start=_safe_int(live_cfg.get("frontier_r_start", 600), 600),
         r_slots=_safe_int(live_cfg.get("frontier_r_slots", 2), 2),
         cooldown_min=_safe_int(live_cfg.get("frontier_cooldown_min", 5), 5),
+        inertia_enabled=bool(live_cfg.get("frontier_inertia_enabled", False)),
+        inertia_global_minute_gap=_safe_int(
+            live_cfg.get("frontier_inertia_global_minute_gap", 0),
+            0,
+        ),
+        inertia_level_group_minute_gap=_safe_int(
+            live_cfg.get("frontier_inertia_level_group_minute_gap", 0),
+            0,
+        ),
+        inertia_override_min_q=(
+            float(inertia_override_raw) if np.isfinite(inertia_override_raw) else None
+        ),
+        inertia_override_min_q_gap=_safe_float(
+            live_cfg.get("frontier_inertia_override_min_q_gap", 0.0),
+            0.0,
+        ),
         diversity_cap=_safe_int(live_cfg.get("frontier_diversity_cap", 2), 2),
         group_unresolved=bool(live_cfg.get("frontier_group_unresolved_enabled", True)),
         unresolved_min=_safe_int(live_cfg.get("frontier_unresolved_min", 10), 10),
@@ -239,6 +283,36 @@ def _router_cfg_from_live(live_cfg: Dict[str, Any]) -> RouterCfg:
         target_hi=_safe_float(live_cfg.get("frontier_virtual_target_hi", 40.0), 40.0),
         stop_lo=_safe_float(live_cfg.get("frontier_virtual_stop_lo", 4.0), 4.0),
         target_lo=_safe_float(live_cfg.get("frontier_virtual_target_lo", 8.0), 8.0),
+        blend_live_cap=_safe_int(live_cfg.get("frontier_blend_live_cap", 5), 5),
+        blend_live_start=_safe_int(live_cfg.get("frontier_blend_live_start", 390), 390),
+        blend_live_end=_safe_int(live_cfg.get("frontier_blend_live_end", 780), 780),
+        blend_live_min_q=_safe_float(live_cfg.get("frontier_blend_live_min_q", 0.0), 0.0),
+        blend_live_flatten_min_q=_safe_float(live_cfg.get("frontier_blend_live_flatten_min_q", 0.66), 0.66),
+        blend_q2_cap=_safe_int(live_cfg.get("frontier_blend_q2_cap", 2), 2),
+        blend_q2_start=_safe_int(live_cfg.get("frontier_blend_q2_start", 450), 450),
+        blend_q2_end=_safe_int(live_cfg.get("frontier_blend_q2_end", 780), 780),
+        blend_q2_min_q=_safe_float(live_cfg.get("frontier_blend_q2_min_q", 0.16), 0.16),
+        blend_q2_flatten_min_q=_safe_float(live_cfg.get("frontier_blend_q2_flatten_min_q", 0.16), 0.16),
+        early_loss_lock_enabled=bool(live_cfg.get("frontier_early_loss_lock_enabled", False)),
+        early_loss_lock_start_minute=_safe_int(
+            live_cfg.get("frontier_early_loss_lock_start_minute", 390),
+            390,
+        ),
+        early_loss_lock_end_minute=_safe_int(
+            live_cfg.get("frontier_early_loss_lock_end_minute", 450),
+            450,
+        ),
+        early_loss_lock_trigger_diff=_safe_int(
+            live_cfg.get("frontier_early_loss_lock_trigger_diff", 1),
+            1,
+        ),
+        early_loss_lock_duration_min=_safe_int(
+            live_cfg.get("frontier_early_loss_lock_duration_min", 45),
+            45,
+        ),
+        early_loss_lock_once_per_day=bool(
+            live_cfg.get("frontier_early_loss_lock_once_per_day", True)
+        ),
     )
 
 
@@ -385,19 +459,148 @@ def _add_runtime_qtwohead(rows: pd.DataFrame, *, model_dir: str, score_col: str 
     return out
 
 
+def _add_runtime_policy_prob(
+    rows: pd.DataFrame,
+    *,
+    model_dir: str,
+    score_col: str = "policy_prob_runtime",
+    use_ensemble_mean: Optional[bool] = None,
+) -> pd.DataFrame:
+    out = rows.copy()
+    md_path = Path(model_dir) / "policy_metadata.json"
+    model_path = Path(model_dir) / "policy_model.json"
+    if not (md_path.exists() and model_path.exists()):
+        out[score_col] = np.nan
+        return out
+
+    try:
+        md = json.loads(md_path.read_text())
+        feat = [str(c) for c in md.get("feature_cols", []) if str(c).strip()]
+        if not feat:
+            out[score_col] = np.nan
+            return out
+        use_ens = bool(md.get("policy_use_ensemble_mean", True)) if use_ensemble_mean is None else bool(use_ensemble_mean)
+        model = xgb.XGBClassifier()
+        model.load_model(str(model_path))
+        ens_models: List[xgb.XGBClassifier] = []
+        for ep in sorted(Path(model_dir).glob("policy_ensemble_*.json")):
+            em = xgb.XGBClassifier()
+            em.load_model(str(ep))
+            ens_models.append(em)
+
+        n = int(len(out))
+        if n <= 0:
+            out[score_col] = np.nan
+            return out
+
+        base_prob = pd.to_numeric(out.get("event_base_prob"), errors="coerce").fillna(0.5).to_numpy(dtype=np.float32, copy=False)
+        side = pd.to_numeric(out.get("side"), errors="coerce").to_numpy(dtype=np.float32, copy=False)
+        if not np.isfinite(side).all():
+            td = pd.to_numeric(out.get("trade_direction"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+            bad = ~np.isfinite(side)
+            if np.any(bad):
+                side[bad] = td[bad]
+
+        if "minute_of_day" in out.columns:
+            minute = pd.to_numeric(out["minute_of_day"], errors="coerce").fillna(-1).to_numpy(dtype=np.int32, copy=False)
+        else:
+            ts = pd.to_datetime(out.get("episode_start_dt", out.get("dt")), errors="coerce")
+            minute = (ts.dt.hour * 60 + ts.dt.minute).fillna(-1).to_numpy(dtype=np.int32, copy=False)
+
+        is_rth = ((minute >= 390) & (minute < 780)).astype(np.float32, copy=False)
+        minute_norm = (minute.astype(np.float32, copy=False) / 1440.0)
+        is_opening = (minute <= 420).astype(np.float32, copy=False)
+        ep_idx = np.zeros(n, dtype=np.float32)
+        ep_log = np.zeros(n, dtype=np.float32)
+        mins_prev = np.full(n, 9999.0, dtype=np.float32)
+        mins_prev_log = np.full(n, float(np.log1p(9999.0)), dtype=np.float32)
+
+        X = np.zeros((n, len(feat)), dtype=np.float32)
+        for j, col in enumerate(feat):
+            if col == "base_prob":
+                X[:, j] = base_prob
+            elif col == "side":
+                X[:, j] = side
+            elif col == "is_rth_session":
+                X[:, j] = is_rth
+            elif col == "minute_of_day_norm":
+                X[:, j] = minute_norm
+            elif col == "episode_index_so_far":
+                X[:, j] = ep_idx
+            elif col == "episode_index_log":
+                X[:, j] = ep_log
+            elif col == "minutes_since_prev_episode":
+                X[:, j] = mins_prev
+            elif col == "minutes_since_prev_episode_log":
+                X[:, j] = mins_prev_log
+            elif col == "is_opening_30m":
+                X[:, j] = is_opening
+            elif col in out.columns:
+                X[:, j] = pd.to_numeric(out[col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+            else:
+                X[:, j] = 0.0
+
+        prob = model.predict_proba(X)[:, 1].astype(np.float64)
+        if ens_models:
+            ens = np.column_stack([m.predict_proba(X)[:, 1] for m in ens_models]).astype(np.float64)
+            if use_ens:
+                prob = ens.mean(axis=1)
+        out[score_col] = np.clip(prob, 0.0, 1.0)
+        return out
+    except Exception:
+        out[score_col] = np.nan
+        return out
+
+
 def _quality_for_row(
     *,
     row: pd.Series,
     router_cfg: RouterCfg,
     policy_scorer: Optional[_PolicyScorer],
     policy_ctx: _PolicyCtx,
-) -> Tuple[float, Optional[float]]:
+) -> Tuple[float, Optional[Dict[str, float]]]:
     src = str(router_cfg.quality_source).strip().lower()
     base_prob = _safe_float(row.get("event_base_prob"), 0.5)
     if src == "policy_prob":
+        p_cached = _safe_float(row.get("policy_prob_runtime"), np.nan)
+        if np.isfinite(p_cached):
+            return float(p_cached), {"policy": float(p_cached)}
         if policy_scorer is None:
             return base_prob, None
-        return policy_scorer.predict(row=row, base_prob=base_prob, policy_ctx=policy_ctx)
+        p, _ = policy_scorer.predict(row=row, base_prob=base_prob, policy_ctx=policy_ctx)
+        return float(p), {"policy": float(p)}
+    if src == "blend_policy_q2":
+        minute = _safe_int(row.get("minute_of_day"), -1)
+        live_q = _safe_float(row.get("policy_prob_runtime"), np.nan)
+        if not np.isfinite(live_q):
+            live_q = float(base_prob)
+        if policy_scorer is not None and (not np.isfinite(_safe_float(row.get("policy_prob_runtime"), np.nan))):
+            p, _ = policy_scorer.predict(row=row, base_prob=base_prob, policy_ctx=policy_ctx)
+            live_q = float(p)
+
+        q2_q = _safe_float(row.get("q_twohead_runtime"), np.nan)
+        if not np.isfinite(q2_q):
+            q2_q = _safe_float(row.get("q_twohead"), np.nan)
+
+        live_ok = (
+            minute >= int(router_cfg.blend_live_start)
+            and minute < int(router_cfg.blend_live_end)
+            and np.isfinite(live_q)
+            and float(live_q) >= float(router_cfg.blend_live_min_q)
+        )
+        q2_ok = (
+            minute >= int(router_cfg.blend_q2_start)
+            and minute < int(router_cfg.blend_q2_end)
+            and np.isfinite(q2_q)
+            and float(q2_q) >= float(router_cfg.blend_q2_min_q)
+        )
+        live_score = float(live_q) if live_ok else float(np.nan)
+        q2_score = float(q2_q) if q2_ok else float(np.nan)
+        if np.isfinite(q2_score) and ((not np.isfinite(live_score)) or q2_score > live_score):
+            return float(q2_score), {"live": live_score, "q2": q2_score}
+        if np.isfinite(live_score):
+            return float(live_score), {"live": live_score, "q2": q2_score}
+        return float(np.nan), {"live": live_score, "q2": q2_score}
     s = _safe_float(row.get(src), np.nan)
     if np.isfinite(s):
         return float(s), None
@@ -460,22 +663,46 @@ def _simulate_variant(
     router_cfg: RouterCfg,
     variant: ExecVariant,
     policy_scorer: Optional[_PolicyScorer],
+    return_state: bool = False,
 ) -> Tuple[np.ndarray, pd.DataFrame, Dict[str, Any]]:
+    quality_src = str(router_cfg.quality_source).strip().lower()
     chosen = np.zeros(len(rows), dtype=bool)
     q_out = np.full(len(rows), np.nan, dtype=np.float64)
     lane_out = np.full(len(rows), "", dtype=object)
+    flatten_min_q_out = np.full(len(rows), np.nan, dtype=np.float64)
 
     lane_counts: Dict[str, int] = {"q": 0, "c": 0, "r": 0}
     action_counts: Dict[str, int] = {}
     trades: List[Dict[str, Any]] = []
+    selected_dir_counts: Dict[int, int] = {1: 0, -1: 0}
+    selected_level_counts: Dict[str, int] = {}
+    day_unique_levels: List[int] = []
+    day_level_hhi: List[float] = []
+    day_long_share: List[float] = []
+    day_short_share: List[float] = []
+    tod_bucket_counts: Dict[str, int] = {
+        "open_60": 0,
+        "post_open_60": 0,
+        "late_morning_120": 0,
+        "afternoon_150": 0,
+    }
 
     for day, idxs in day_groups:
         q_used = c_used = r_used = 0
         accepted = 0
         last_minute = -10_000
+        blend_live_used = 0
+        blend_q2_used = 0
         level_counts: Dict[str, int] = {}
         unresolved_until: Dict[Tuple[str, int], int] = {}
+        inertia_last_global: Optional[Dict[str, float]] = None
+        inertia_last_by_group: Dict[str, Dict[str, float]] = {}
         ctx = _PolicyCtx()
+        realized_wins = 0
+        realized_losses = 0
+        early_loss_lock_until_minute = -1
+        early_loss_lock_triggered_today = False
+        virtual_open_trades: List[Dict[str, Any]] = []
 
         day_idxs: List[int] = []
         for pos in idxs:
@@ -483,7 +710,97 @@ def _simulate_variant(
             minute = _safe_int(row.get("minute_of_day"), -1)
             if minute < 390 or minute >= 780:
                 continue
-            score, _ = _quality_for_row(row=row, router_cfg=router_cfg, policy_scorer=policy_scorer, policy_ctx=ctx)
+            bar_num = _safe_int(row.get("episode_start_idx"), -1)
+            if 0 <= bar_num < len(high):
+                hi_now = _safe_float(high[int(bar_num)], np.nan)
+                lo_now = _safe_float(low[int(bar_num)], np.nan)
+                for tr in virtual_open_trades:
+                    if bool(tr.get("closed", False)):
+                        continue
+                    entry_bar = _safe_int(tr.get("entry_bar"), -1)
+                    if bar_num <= entry_bar:
+                        continue
+                    direction_v = _safe_int(tr.get("direction"), 0)
+                    stop_px = _safe_float(tr.get("stop_px"), np.nan)
+                    target_px = _safe_float(tr.get("target_px"), np.nan)
+                    if direction_v == 0 or (not np.isfinite(stop_px)) or (not np.isfinite(target_px)):
+                        continue
+                    hit: Optional[str] = None
+                    if direction_v > 0:
+                        if lo_now <= stop_px and hi_now >= target_px:
+                            hit = "stop_tie"
+                        elif lo_now <= stop_px:
+                            hit = "stop"
+                        elif hi_now >= target_px:
+                            hit = "target"
+                    else:
+                        if hi_now >= stop_px and lo_now <= target_px:
+                            hit = "stop_tie"
+                        elif hi_now >= stop_px:
+                            hit = "stop"
+                        elif lo_now <= target_px:
+                            hit = "target"
+                    if hit is None:
+                        continue
+                    tr["closed"] = True
+                    tr["exit_reason"] = str(hit)
+                    if str(hit).startswith("stop"):
+                        realized_losses += 1
+                    else:
+                        realized_wins += 1
+
+            if bool(router_cfg.early_loss_lock_enabled):
+                if int(early_loss_lock_until_minute) >= int(minute):
+                    continue
+                if not (
+                    bool(router_cfg.early_loss_lock_once_per_day)
+                    and bool(early_loss_lock_triggered_today)
+                ):
+                    lock_start = _safe_int(router_cfg.early_loss_lock_start_minute, 390)
+                    lock_end = _safe_int(router_cfg.early_loss_lock_end_minute, 450)
+                    if lock_start > lock_end:
+                        lock_start, lock_end = lock_end, lock_start
+                    trigger_diff = max(_safe_int(router_cfg.early_loss_lock_trigger_diff, 1), 1)
+                    lock_dur = max(_safe_int(router_cfg.early_loss_lock_duration_min, 45), 0)
+                    if (
+                        int(minute) >= int(lock_start)
+                        and int(minute) <= int(lock_end)
+                        and lock_dur > 0
+                        and (int(realized_losses) - int(realized_wins)) >= int(trigger_diff)
+                    ):
+                        early_loss_lock_until_minute = min(int(minute) + int(lock_dur), 779)
+                        early_loss_lock_triggered_today = True
+                        continue
+            score, score_meta = _quality_for_row(
+                row=row,
+                router_cfg=router_cfg,
+                policy_scorer=policy_scorer,
+                policy_ctx=ctx,
+            )
+            blend_expert: Optional[str] = None
+            if quality_src == "blend_policy_q2":
+                live_s = float(np.nan)
+                q2_s = float(np.nan)
+                if isinstance(score_meta, dict):
+                    live_s = _safe_float(score_meta.get("live"), np.nan)
+                    q2_s = _safe_float(score_meta.get("q2"), np.nan)
+                cand_scores: List[Tuple[str, float]] = []
+                if np.isfinite(live_s) and (
+                    int(router_cfg.blend_live_cap) <= 0 or int(blend_live_used) < int(router_cfg.blend_live_cap)
+                ):
+                    cand_scores.append(("live", float(live_s)))
+                if np.isfinite(q2_s) and (
+                    int(router_cfg.blend_q2_cap) <= 0 or int(blend_q2_used) < int(router_cfg.blend_q2_cap)
+                ):
+                    cand_scores.append(("q2", float(q2_s)))
+                if not cand_scores:
+                    continue
+                cand_scores = sorted(cand_scores, key=lambda x: float(x[1]), reverse=True)
+                blend_expert = str(cand_scores[0][0])
+                score = float(cand_scores[0][1])
+
+            if not np.isfinite(score):
+                continue
             q_out[int(pos)] = float(score)
 
             lane: Optional[str] = None
@@ -510,24 +827,130 @@ def _simulate_variant(
                     continue
                 unresolved_until[key] = int(minute) + int(router_cfg.unresolved_min)
 
+            if bool(router_cfg.inertia_enabled):
+                block = False
+
+                def _override_ok(last_q: float) -> bool:
+                    has_override = (
+                        router_cfg.inertia_override_min_q is not None
+                        or float(router_cfg.inertia_override_min_q_gap) > 0.0
+                    )
+                    if not has_override:
+                        return False
+                    if (
+                        router_cfg.inertia_override_min_q is not None
+                        and float(score) < float(router_cfg.inertia_override_min_q)
+                    ):
+                        return False
+                    if float(router_cfg.inertia_override_min_q_gap) > 0.0 and (
+                        float(score) - float(last_q)
+                    ) < float(router_cfg.inertia_override_min_q_gap):
+                        return False
+                    return True
+
+                if int(router_cfg.inertia_level_group_minute_gap) > 0:
+                    grp = _level_group(lvl)
+                    last_grp = inertia_last_by_group.get(str(grp))
+                    if last_grp is not None and int(last_grp.get("direction", 0)) != int(direction):
+                        dt = int(minute) - int(last_grp.get("minute", -10_000))
+                        if dt < int(router_cfg.inertia_level_group_minute_gap):
+                            if not _override_ok(float(last_grp.get("quality", 0.0))):
+                                block = True
+                if (not block) and int(router_cfg.inertia_global_minute_gap) > 0 and inertia_last_global is not None:
+                    if int(inertia_last_global.get("direction", 0)) != int(direction):
+                        dt = int(minute) - int(inertia_last_global.get("minute", -10_000))
+                        if dt < int(router_cfg.inertia_global_minute_gap):
+                            if not _override_ok(float(inertia_last_global.get("quality", 0.0))):
+                                block = True
+                if block:
+                    continue
+
             chosen[int(pos)] = True
             lane_out[int(pos)] = str(lane)
             accepted += 1
             last_minute = int(minute)
             level_counts[lvl] = int(level_counts.get(lvl, 0)) + 1
+            selected_level_counts[str(lvl)] = int(selected_level_counts.get(str(lvl), 0)) + 1
+            selected_dir_counts[int(direction)] = int(selected_dir_counts.get(int(direction), 0)) + 1
             if lane == "q":
                 q_used += 1
             elif lane == "c":
                 c_used += 1
             else:
                 r_used += 1
+            if blend_expert == "live":
+                blend_live_used += 1
+            elif blend_expert == "q2":
+                blend_q2_used += 1
             lane_counts[str(lane)] = int(lane_counts.get(str(lane), 0)) + 1
             day_idxs.append(int(pos))
+            if quality_src == "blend_policy_q2":
+                if blend_expert == "q2":
+                    flatten_min_q_out[int(pos)] = float(router_cfg.blend_q2_flatten_min_q)
+                elif blend_expert == "live":
+                    flatten_min_q_out[int(pos)] = float(router_cfg.blend_live_flatten_min_q)
 
-            ts = _norm_ts(row.get("episode_start_dt"))
-            ctx.episodes_started_today += 1
-            if ts is not None:
-                ctx.last_episode_ts = ts
+            entry_idx_v = _safe_int(row.get("episode_start_idx"), -1)
+            direction_v = _safe_int(row.get("trade_direction"), 0)
+            if 0 <= entry_idx_v < len(close) and direction_v != 0:
+                entry_px = _safe_float(close[int(entry_idx_v)], np.nan)
+                if np.isfinite(entry_px):
+                    hi_lane = float(score) >= float(router_cfg.gate)
+                    stop_pts = float(router_cfg.stop_hi if hi_lane else router_cfg.stop_lo)
+                    target_pts = float(router_cfg.target_hi if hi_lane else router_cfg.target_lo)
+                    if stop_pts > 0.0 and target_pts > 0.0:
+                        if int(direction_v) > 0:
+                            stop_px = float(entry_px - stop_pts)
+                            target_px = float(entry_px + target_pts)
+                        else:
+                            stop_px = float(entry_px + stop_pts)
+                            target_px = float(entry_px - target_pts)
+                        virtual_open_trades.append(
+                            {
+                                "entry_bar": int(entry_idx_v),
+                                "direction": int(direction_v),
+                                "stop_px": float(stop_px),
+                                "target_px": float(target_px),
+                                "closed": False,
+                            }
+                        )
+
+            rec = {
+                "minute": float(int(minute)),
+                "direction": float(int(direction)),
+                "quality": float(score),
+            }
+            inertia_last_global = dict(rec)
+            inertia_last_by_group[str(_level_group(lvl))] = dict(rec)
+
+            if 390 <= int(minute) < 450:
+                tod_bucket_counts["open_60"] = int(tod_bucket_counts["open_60"]) + 1
+            elif 450 <= int(minute) < 510:
+                tod_bucket_counts["post_open_60"] = int(tod_bucket_counts["post_open_60"]) + 1
+            elif 510 <= int(minute) < 630:
+                tod_bucket_counts["late_morning_120"] = int(tod_bucket_counts["late_morning_120"]) + 1
+            elif 630 <= int(minute) < 780:
+                tod_bucket_counts["afternoon_150"] = int(tod_bucket_counts["afternoon_150"]) + 1
+
+            if quality_src == "policy_prob":
+                ts = _norm_ts(row.get("episode_start_dt"))
+                ctx.episodes_started_today += 1
+                if ts is not None:
+                    ctx.last_episode_ts = ts
+
+        if level_counts:
+            cnt = np.asarray(list(level_counts.values()), dtype=np.float64)
+            p = cnt / max(float(cnt.sum()), 1.0)
+            day_level_hhi.append(float(np.sum(np.square(p))))
+            day_unique_levels.append(int(len(level_counts)))
+            # Direction split from selected events on this day.
+            day_rows = rows.loc[day_idxs, "trade_direction"] if day_idxs else pd.Series(dtype=float)
+            dvals = pd.to_numeric(day_rows, errors="coerce").fillna(0).astype(int)
+            long_n = int((dvals > 0).sum())
+            short_n = int((dvals < 0).sum())
+            denom = max(long_n + short_n, 1)
+            day_long_share.append(float(long_n / denom))
+            day_short_share.append(float(short_n / denom))
 
         if not day_idxs:
             continue
@@ -540,6 +963,9 @@ def _simulate_variant(
         )
         day_events["quality"] = q_out[day_events["row_idx"].to_numpy(dtype=np.int64, copy=False)]
         day_events["lane"] = lane_out[day_events["row_idx"].to_numpy(dtype=np.int64, copy=False)]
+        day_events["flatten_min_q"] = flatten_min_q_out[
+            day_events["row_idx"].to_numpy(dtype=np.int64, copy=False)
+        ]
         day_events["minute_of_day"] = pd.to_numeric(
             rows.loc[day_events["row_idx"].to_numpy(dtype=np.int64, copy=False), "minute_of_day"],
             errors="coerce",
@@ -677,6 +1103,9 @@ def _simulate_variant(
             mode = str(variant.opposite_action).lower()
             if mode == "ignore":
                 continue
+            flatten_min_q = _safe_float(ev.get("flatten_min_q"), np.nan)
+            if np.isfinite(flatten_min_q) and float(qv) < float(flatten_min_q):
+                continue
             pnl = float((float(close[i]) - float(pos["entry_price"])) * float(pos["direction"]))
             exit_reason = "flip_signal" if mode == "flip_or_flatten" else "flatten_signal"
             trades.append(
@@ -741,11 +1170,34 @@ def _simulate_variant(
                 )
 
     tdf = pd.DataFrame(trades)
+    total_selected = int(chosen.sum())
+    long_sel = int(selected_dir_counts.get(1, 0))
+    short_sel = int(selected_dir_counts.get(-1, 0))
+    denom_dir = max(long_sel + short_sel, 1)
+    denom_tod = max(sum(int(v) for v in tod_bucket_counts.values()), 1)
     diag = {
-        "selected": int(chosen.sum()),
+        "selected": total_selected,
         "lane_counts": lane_counts,
         "action_counts": action_counts,
+        "diversity": {
+            "unique_levels_total": int(len(selected_level_counts)),
+            "mean_unique_levels_per_day": float(np.mean(day_unique_levels)) if day_unique_levels else 0.0,
+            "mean_level_hhi_per_day": float(np.mean(day_level_hhi)) if day_level_hhi else 0.0,
+            "long_selected_share": float(long_sel / denom_dir),
+            "short_selected_share": float(short_sel / denom_dir),
+            "mean_long_share_per_day": float(np.mean(day_long_share)) if day_long_share else 0.0,
+            "mean_short_share_per_day": float(np.mean(day_short_share)) if day_short_share else 0.0,
+            "open_60_share": float(int(tod_bucket_counts["open_60"]) / denom_tod),
+            "post_open_60_share": float(int(tod_bucket_counts["post_open_60"]) / denom_tod),
+            "late_morning_120_share": float(int(tod_bucket_counts["late_morning_120"]) / denom_tod),
+            "afternoon_150_share": float(int(tod_bucket_counts["afternoon_150"]) / denom_tod),
+        },
     }
+    if bool(return_state):
+        diag["state"] = {
+            "quality_by_row": q_out.copy(),
+            "router_lane_by_row": lane_out.copy(),
+        }
     return chosen, tdf, diag
 
 
@@ -846,4 +1298,3 @@ def _exec_metrics(trades: pd.DataFrame, day_ids: List[str]) -> Dict[str, Any]:
         "timed_exit_rate": float((exits == "timed").mean()),
         "manual_exit_rate": float(exits.isin(["flip_signal", "flatten_signal", "replace_signal"]).mean()),
     }
-
