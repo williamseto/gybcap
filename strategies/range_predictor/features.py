@@ -292,7 +292,12 @@ def compute_range_features(daily: pd.DataFrame) -> pd.DataFrame:
     if 'nearby_gamma_score' in daily.columns:
         feat['nearby_gamma_score'] = daily['nearby_gamma_score']
 
-    return feat.fillna(0.0)
+    # Causality guard:
+    # Targets for date t represent the forward range from t onward (anchored to
+    # prev close). Features must therefore only use information known by the
+    # start of date t. Shift all engineered daily features by 1 day so feature
+    # row t is computed from data through t-1.
+    return feat.shift(1).fillna(0.0)
 
 
 # Feature name list for reference
