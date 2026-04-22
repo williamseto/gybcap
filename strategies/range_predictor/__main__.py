@@ -79,6 +79,10 @@ def cmd_train(args):
 
     trainer.train_all(daily, verbose=True)
 
+    if args.newsletter:
+        newsletter = pd.read_csv(args.newsletter, parse_dates=['date'])
+        trainer.train_newsletter(daily, newsletter, verbose=True)
+
     if args.rth:
         trainer.train_rth(daily, rth_daily, verbose=True)
 
@@ -199,6 +203,10 @@ def main():
     train_p.add_argument(
         '--correlations', action='store_true',
         help='Run feature correlation analysis before training',
+    )
+    train_p.add_argument(
+        '--newsletter',
+        help='Newsletter CSV path — also trains newsletter replica model',
     )
     train_p.add_argument(
         '--rth', action='store_true',

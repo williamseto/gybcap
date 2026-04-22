@@ -50,12 +50,13 @@ class RangePredictor:
 
         for tf in self.timeframes:
             self.models[tf] = {}
-            # RTH models use rth_range_high/low_pct target names
             if tf == 'rth':
-                targets = ['rth_range_high_pct', 'rth_range_low_pct']
+                candidates = ['rth_range_high_pct', 'rth_range_low_pct']
+            elif tf == 'nl_daily':
+                candidates = ['width_pct', 'center_pct']
             else:
-                targets = ['range_high_pct', 'range_low_pct']
-            for target in targets:
+                candidates = ['width_pct', 'center_pct', 'range_high_pct', 'range_low_pct']
+            for target in candidates:
                 key = f"{tf}/{target}"
                 if key not in metadata:
                     continue
@@ -103,20 +104,26 @@ class RangePredictor:
                 continue
 
             tf_result = {}
+            tf_models = self.models[tf]
 
-            if 'range_high_pct' in self.models[tf]:
-                high_pct = self.models[tf]['range_high_pct'].predict(X)[0]
-                tf_result['range_high_pct'] = float(high_pct)
-                tf_result['range_high'] = round(
-                    last_close * (1 + high_pct), 2
-                )
-
-            if 'range_low_pct' in self.models[tf]:
-                low_pct = self.models[tf]['range_low_pct'].predict(X)[0]
-                tf_result['range_low_pct'] = float(low_pct)
-                tf_result['range_low'] = round(
-                    last_close * (1 - low_pct), 2
-                )
+            if 'width_pct' in tf_models and 'center_pct' in tf_models:
+                width = float(tf_models['width_pct'].predict(X)[0])
+                center = float(tf_models['center_pct'].predict(X)[0])
+                high_pct = width / 2 + center
+                low_pct = max(width / 2 - center, 0.0)
+                tf_result['range_high_pct'] = high_pct
+                tf_result['range_low_pct'] = low_pct
+                tf_result['range_high'] = round(last_close * (1 + high_pct), 2)
+                tf_result['range_low'] = round(last_close * (1 - low_pct), 2)
+            else:
+                if 'range_high_pct' in tf_models:
+                    high_pct = float(tf_models['range_high_pct'].predict(X)[0])
+                    tf_result['range_high_pct'] = high_pct
+                    tf_result['range_high'] = round(last_close * (1 + high_pct), 2)
+                if 'range_low_pct' in tf_models:
+                    low_pct = float(tf_models['range_low_pct'].predict(X)[0])
+                    tf_result['range_low_pct'] = low_pct
+                    tf_result['range_low'] = round(last_close * (1 - low_pct), 2)
 
             if 'range_high' in tf_result and 'range_low' in tf_result:
                 tf_result['range_width'] = round(
@@ -149,12 +156,18 @@ class RangePredictor:
         X = features[available].fillna(0.0).values
 
         preds = pd.DataFrame(index=daily.index)
+        tf_models = self.models[timeframe]
 
-        for target in ['range_high_pct', 'range_low_pct']:
-            if target in self.models[timeframe]:
-                preds[f'pred_{target}'] = self.models[timeframe][target].predict(X)
+        if 'width_pct' in tf_models and 'center_pct' in tf_models:
+            preds['pred_width_pct'] = tf_models['width_pct'].predict(X)
+            preds['pred_center_pct'] = tf_models['center_pct'].predict(X)
+            preds['pred_range_high_pct'] = preds['pred_width_pct'] / 2 + preds['pred_center_pct']
+            preds['pred_range_low_pct'] = (preds['pred_width_pct'] / 2 - preds['pred_center_pct']).clip(lower=0)
+        else:
+            for target in ['range_high_pct', 'range_low_pct']:
+                if target in tf_models:
+                    preds[f'pred_{target}'] = tf_models[target].predict(X)
 
-        # Convert to price levels
         prev_close = daily['close'].shift(1)
         if 'pred_range_high_pct' in preds.columns:
             preds['pred_range_high'] = prev_close * (1 + preds['pred_range_high_pct'])

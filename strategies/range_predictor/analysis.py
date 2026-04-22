@@ -82,12 +82,12 @@ def _generate_oos_predictions(
     test_per_fold = (n - min_train_days) // n_folds
 
     X_all = features_df[feature_names].values
-    y_high = targets_df['range_high_pct'].values
-    y_low = targets_df['range_low_pct'].values
+    y_width = targets_df['width_pct'].values
+    y_center = targets_df['center_pct'].values
     dates = features_df.index
 
-    oos_high = {}
-    oos_low = {}
+    oos_width = {}
+    oos_center = {}
 
     for fold in range(n_folds):
         train_end = min_train_days + fold * test_per_fold
@@ -102,20 +102,22 @@ def _generate_oos_predictions(
         if len(X_te) == 0:
             continue
 
-        m_high = XGBRegressor(**config.xgb_params)
-        m_high.fit(X_tr, y_high[:train_end])
-        m_low = XGBRegressor(**config.xgb_params)
-        m_low.fit(X_tr, y_low[:train_end])
+        m_width = XGBRegressor(**config.xgb_params)
+        m_width.fit(X_tr, y_width[:train_end])
+        m_center = XGBRegressor(**config.xgb_params)
+        m_center.fit(X_tr, y_center[:train_end])
 
-        for d, ph, pl in zip(dates_te, m_high.predict(X_te), m_low.predict(X_te)):
-            oos_high[d] = ph
-            oos_low[d] = pl
+        for d, pw, pc in zip(dates_te, m_width.predict(X_te), m_center.predict(X_te)):
+            oos_width[d] = pw
+            oos_center[d] = pc
 
     prev_close = daily['close'].shift(1)
     result = pd.DataFrame({
-        'pred_range_high_pct': pd.Series(oos_high),
-        'pred_range_low_pct':  pd.Series(oos_low),
+        'pred_width_pct':  pd.Series(oos_width),
+        'pred_center_pct': pd.Series(oos_center),
     })
+    result['pred_range_high_pct'] = result['pred_width_pct'] / 2 + result['pred_center_pct']
+    result['pred_range_low_pct'] = (result['pred_width_pct'] / 2 - result['pred_center_pct']).clip(lower=0)
     result['pred_range_high'] = prev_close.reindex(result.index) * (1 + result['pred_range_high_pct'])
     result['pred_range_low']  = prev_close.reindex(result.index) * (1 - result['pred_range_low_pct'])
 

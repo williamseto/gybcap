@@ -3,6 +3,7 @@
 Usage:
     python -m strategies.range_predictor.newsletter analyze --newsletter PATH
     python -m strategies.range_predictor.newsletter reverse-engineer --newsletter PATH
+    python -m strategies.range_predictor.newsletter formula --newsletter PATH
     python -m strategies.range_predictor.newsletter compare --newsletter PATH
     python -m strategies.range_predictor.newsletter compare-tf --newsletter PATH
     python -m strategies.range_predictor.newsletter fetch-emails [--since DATE]
@@ -93,6 +94,21 @@ def cmd_compare(args):
     comprehensive_comparison(
         predictor, daily, newsletter,
         output_path=args.output,
+        verbose=True,
+    )
+
+
+def cmd_formula(args):
+    """Fit and evaluate the reverse-engineered newsletter formula."""
+    from strategies.range_predictor.newsletter.formula import run_formula_analysis
+
+    daily = _load_daily(args.data)
+    newsletter = pd.read_csv(args.newsletter, parse_dates=['date'])
+
+    run_formula_analysis(
+        daily, newsletter,
+        n_folds=args.folds,
+        min_train_days=args.min_train_days,
         verbose=True,
     )
 
@@ -203,6 +219,25 @@ def main():
         help='Output CSV path for comparison results',
     )
 
+    # ── formula ──
+    fm_p = subparsers.add_parser(
+        'formula',
+        help='Fit and evaluate the linear newsletter replica formula '
+             '(nl_width_t ~ AR(1) + prev_ret + |prev_ret|)',
+    )
+    fm_p.add_argument(
+        '--newsletter', required=True,
+        help='Newsletter predictions CSV path',
+    )
+    fm_p.add_argument(
+        '--data', '-d',
+        default='raw_data/es_min_3y_clean_td_gamma.csv',
+        help='Input 1-min data CSV path',
+    )
+    fm_p.add_argument('--folds', type=int, default=5,
+                      help='Walk-forward folds for OOS evaluation')
+    fm_p.add_argument('--min-train-days', type=int, default=100)
+
     # ── fetch-emails ──
     fetch_p = subparsers.add_parser(
         'fetch-emails', help='Fetch and parse newsletter emails',
@@ -217,6 +252,8 @@ def main():
         cmd_analyze(args)
     elif args.command == 'reverse-engineer':
         cmd_reverse_engineer(args)
+    elif args.command == 'formula':
+        cmd_formula(args)
     elif args.command == 'compare':
         cmd_compare(args)
     elif args.command == 'compare-tf':

@@ -20,6 +20,7 @@ from strategies.range_predictor.features import (
     compute_targets,
     get_feature_names,
     prepare_dataset,
+    prepare_newsletter_dataset,
     prepare_rth_dataset,
 )
 
@@ -162,7 +163,15 @@ class RangeTrainer:
         timeframe: str = 'daily',
         verbose: bool = True,
     ) -> Dict[str, XGBRegressor]:
-        """Train models for a single timeframe.
+        """Train models for a single timeframe using width/center decomposition.
+
+        Trains on width_pct (volatility-driven, total range) and center_pct
+        (directional bias) instead of high/low independently. This separates
+        the easy volatility problem from the hard directional problem.
+
+        At prediction time, high/low are recovered:
+            high_pct = width_pct/2 + center_pct
+            low_pct  = width_pct/2 - center_pct
 
         Args:
             daily: Daily OHLCV DataFrame (DatetimeIndex).
@@ -188,11 +197,11 @@ class RangeTrainer:
         models = {}
         cv_results = {}
 
-        for target in ['range_high_pct', 'range_low_pct']:
+        for target in ['width_pct', 'center_pct']:
             if verbose:
-                print(f"\n--- Target: {target} ---")
+                label = 'width (vol)' if target == 'width_pct' else 'center (dir)'
+                print(f"\n--- Target: {target} [{label}] ---")
 
-            # Walk-forward CV
             cv = self.walk_forward_cv(
                 features_df, targets_df, feature_names, target,
                 n_folds=self.config.walk_forward_folds,
@@ -201,14 +210,12 @@ class RangeTrainer:
             )
             cv_results[target] = cv
 
-            # Train final model on all data
             X = features_df[feature_names].values
             y = targets_df[target].values
             model = self._train_single_model(X, y)
             models[target] = model
 
             if verbose:
-                # Feature importance
                 importance = pd.Series(
                     model.feature_importances_, index=feature_names
                 ).sort_values(ascending=False)
@@ -250,6 +257,95 @@ class RangeTrainer:
                     print(f"  {tf}/{target}: R2={cv['overall_r2']:.4f}, "
                           f"MAE={cv['overall_mae']:.6f}, "
                           f"corr={cv['correlation']:.4f}")
+
+    def train_newsletter(
+        self,
+        daily: pd.DataFrame,
+        newsletter: pd.DataFrame,
+        verbose: bool = True,
+    ) -> Dict[str, XGBRegressor]:
+        """Train models to replicate newsletter range predictions.
+
+        Uses newsletter high/low as targets (width/center decomposition).
+        Only trains a 'daily' timeframe since the newsletter publishes
+        daily ES ranges.
+
+        Args:
+            daily: Daily OHLCV DataFrame (DatetimeIndex).
+            newsletter: Newsletter predictions DataFrame.
+            verbose: Print progress.
+
+        Returns:
+            Dict mapping target name to trained model.
+        """
+        if verbose:
+            print(f"\n{'='*60}")
+            print("TRAINING NEWSLETTER REPLICA — DAILY")
+            print(f"{'='*60}")
+
+        features_df, targets_df, feature_names = prepare_newsletter_dataset(
+            daily, newsletter
+        )
+
+        if verbose:
+            print(f"Dataset: {len(features_df)} days, {len(feature_names)} features")
+
+        models = {}
+        cv_results = {}
+
+        # Train on all four targets to report full diagnostics
+        for target in ['nl_width_pct', 'nl_center_pct', 'nl_high_pct', 'nl_low_pct']:
+            if verbose:
+                label = {
+                    'nl_width_pct': 'width (vol)',
+                    'nl_center_pct': 'center (dir)',
+                    'nl_high_pct': 'high boundary',
+                    'nl_low_pct': 'low boundary',
+                }[target]
+                print(f"\n--- Target: {target} [{label}] ---")
+
+            cv = self.walk_forward_cv(
+                features_df, targets_df, feature_names, target,
+                n_folds=self.config.walk_forward_folds,
+                min_train_days=self.config.min_train_days,
+                verbose=verbose,
+            )
+            cv_results[target] = cv
+
+            X = features_df[feature_names].values
+            y = targets_df[target].values
+            model = self._train_single_model(X, y)
+            models[target] = model
+
+            if verbose:
+                importance = pd.Series(
+                    model.feature_importances_, index=feature_names
+                ).sort_values(ascending=False)
+                total_imp = importance.sum()
+                print(f"\n  Top 10 features for {target}:")
+                for fname, imp in importance.head(10).items():
+                    pct = imp / total_imp * 100 if total_imp > 0 else 0
+                    print(f"    {fname}: {pct:.1f}%")
+
+        # Store width/center as the primary models for prediction
+        self.models['nl_daily'] = {
+            'width_pct': models['nl_width_pct'],
+            'center_pct': models['nl_center_pct'],
+        }
+        self.results['nl_daily'] = {
+            'cv_results': cv_results,
+            'feature_names': feature_names,
+            'n_samples': len(features_df),
+        }
+
+        if verbose:
+            print(f"\n  Newsletter Replica Summary:")
+            for target, cv in cv_results.items():
+                print(f"    {target}: R2={cv['overall_r2']:.4f}, "
+                      f"MAE={cv['overall_mae']:.6f}, "
+                      f"corr={cv['correlation']:.4f}")
+
+        return models
 
     def train_rth(
         self,
@@ -343,28 +439,32 @@ class RangeTrainer:
         metadata = {}
 
         for tf, models in self.models.items():
+            cv_results = self.results[tf]['cv_results']
             for target, model in models.items():
-                # RTH models: save as rth_range_high_pct.json (not rth_rth_range_high_pct.json)
                 if tf == 'rth':
                     fname = f"{target}.json"
                 else:
                     fname = f"{tf}_{target}.json"
                 fpath = os.path.join(model_dir, fname)
                 model.save_model(fpath)
+
+                # Look up CV results: exact key first, then nl_ prefix for newsletter models
+                cv = cv_results.get(target) or cv_results.get(f'nl_{target}', {})
                 metadata[f"{tf}/{target}"] = {
                     'file': fname,
                     'cv_results': {
-                        k: v for k, v in self.results[tf]['cv_results'][target].items()
+                        k: v for k, v in cv.items()
                         if k != 'fold_results'
                     },
                 }
 
-        # Save metadata — use non-RTH timeframe for base feature names
-        non_rth_tfs = [tf for tf in self.results if tf != 'rth']
-        if non_rth_tfs:
-            metadata['feature_names'] = self.results[non_rth_tfs[0]]['feature_names']
+        # Save metadata — use a standard timeframe for base feature names
+        base_tfs = [tf for tf in self.results if tf not in ('rth', 'nl_daily')]
+        if base_tfs:
+            metadata['feature_names'] = self.results[base_tfs[0]]['feature_names']
+        elif 'nl_daily' in self.results:
+            metadata['feature_names'] = self.results['nl_daily']['feature_names']
         elif 'rth' in self.results:
-            # Only RTH was trained — still save base features
             metadata['feature_names'] = self.results['rth']['feature_names']
 
         metadata['timeframes'] = list(self.models.keys())

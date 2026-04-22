@@ -98,6 +98,10 @@ def compute_targets(
     targets['range_high_pct'] = (future_highs - prev_close) / prev_close
     targets['range_low_pct'] = (prev_close - future_lows) / prev_close
 
+    # Decomposed targets: width is volatility-driven, center is directional
+    targets['width_pct'] = targets['range_high_pct'] + targets['range_low_pct']
+    targets['center_pct'] = (targets['range_high_pct'] - targets['range_low_pct']) / 2
+
     return targets
 
 
@@ -154,6 +158,23 @@ def compute_range_features(daily: pd.DataFrame) -> pd.DataFrame:
     # ATR as pct of close (vol proxy comparable across price levels)
     feat['atr_pct_14'] = atr_14 / c
 
+    # ── Volatility regime / dynamics ───────────────────────────────────
+    # ATR percentile rank in rolling 252d window (0=lowest vol, 1=highest)
+    atr_roll_min = atr_14.rolling(252, min_periods=60).min()
+    atr_roll_max = atr_14.rolling(252, min_periods=60).max()
+    atr_roll_span = (atr_roll_max - atr_roll_min).replace(0, np.nan)
+    feat['atr_pctile_252d'] = (atr_14 - atr_roll_min) / atr_roll_span
+
+    # ATR momentum: how fast is vol changing?
+    feat['atr_momentum_5d'] = atr_14.pct_change(5)
+    feat['atr_momentum_10d'] = atr_14.pct_change(10)
+
+    # Squared returns (GARCH-style conditional variance proxy)
+    log_ret_sq = log_ret ** 2
+    feat['sq_ret_lag1'] = log_ret_sq.shift(1)
+    feat['sq_ret_ewm5'] = log_ret_sq.ewm(span=5).mean().shift(1)
+    feat['sq_ret_ewm20'] = log_ret_sq.ewm(span=20).mean().shift(1)
+
     # ── Autoregressive range features ───────────────────────────────────
     day_range_pct = (h - l) / c
     feat['range_pct_lag1'] = day_range_pct.shift(1)
@@ -163,6 +184,8 @@ def compute_range_features(daily: pd.DataFrame) -> pd.DataFrame:
     feat['range_pct_ma5'] = day_range_pct.rolling(5).mean().shift(1)
     feat['range_pct_ma20'] = day_range_pct.rolling(20).mean().shift(1)
     feat['range_pct_ma60'] = day_range_pct.rolling(60).mean().shift(1)
+    feat['range_pct_ewm5'] = day_range_pct.ewm(span=5).mean().shift(1)
+    feat['range_pct_ewm20'] = day_range_pct.ewm(span=20).mean().shift(1)
 
     # Realized high/low pct (how far from prev close)
     high_move_pct = (h - c.shift(1)) / c.shift(1)
@@ -171,6 +194,16 @@ def compute_range_features(daily: pd.DataFrame) -> pd.DataFrame:
     feat['low_move_pct_lag1'] = low_move_pct.shift(1)
     feat['high_move_pct_ma5'] = high_move_pct.rolling(5).mean().shift(1)
     feat['low_move_pct_ma5'] = low_move_pct.rolling(5).mean().shift(1)
+
+    # Range vs ATR ratio (is realized range over/under-shooting ATR?)
+    atr_pct_14_raw = atr_14 / c.replace(0, np.nan)
+    range_atr_ratio = day_range_pct / atr_pct_14_raw.replace(0, np.nan)
+    feat['range_atr_ratio_lag1'] = range_atr_ratio.shift(1)
+    feat['range_atr_ratio_ma5'] = range_atr_ratio.rolling(5).mean().shift(1)
+
+    # High/low asymmetry from prev close
+    feat['hi_lo_asymmetry_lag1'] = (high_move_pct - low_move_pct).shift(1)
+    feat['hi_lo_asymmetry_ma5'] = (high_move_pct - low_move_pct).rolling(5).mean().shift(1)
 
     # ── Returns / momentum ──────────────────────────────────────────────
     feat['return_1d'] = c.pct_change()
@@ -264,6 +297,16 @@ def compute_range_features(daily: pd.DataFrame) -> pd.DataFrame:
             (roll_range / c) / avg_width.replace(0, np.nan)
         )
 
+    # ── OHLC bar structure (lagged) ───────────────────────────────────
+    bar_range = (h - l).replace(0, np.nan)
+    feat['body_range_ratio_lag1'] = ((c - o).abs() / bar_range).shift(1)
+    feat['close_position_lag1'] = ((c - l) / bar_range).shift(1)
+
+    # ── Directional features ───────────────────────────────────────────
+    up_day = (c > c.shift(1)).astype(float)
+    feat['up_days_5d'] = up_day.rolling(5).sum().shift(1)
+    feat['up_days_10d'] = up_day.rolling(10).sum().shift(1)
+
     # ── Seasonality (cyclical encoding) ─────────────────────────────────
     # Day-of-week
     dow = daily.index.dayofweek
@@ -295,9 +338,28 @@ def compute_range_features(daily: pd.DataFrame) -> pd.DataFrame:
     # Causality guard:
     # Targets for date t represent the forward range from t onward (anchored to
     # prev close). Features must therefore only use information known by the
-    # start of date t. Shift all engineered daily features by 1 day so feature
-    # row t is computed from data through t-1.
-    return feat.shift(1).fillna(0.0)
+    # start of date t. Shift columns that use day-t OHLCV by 1 so feature row t
+    # is computed from data through t-1. Autoregressive lag features and calendar
+    # features already satisfy this and must NOT be double-shifted.
+    _ALREADY_CAUSAL = {
+        'range_pct_lag1', 'range_pct_lag2', 'range_pct_lag3', 'range_pct_lag5',
+        'range_pct_ma5', 'range_pct_ma20', 'range_pct_ma60',
+        'range_pct_ewm5', 'range_pct_ewm20',
+        'high_move_pct_lag1', 'low_move_pct_lag1',
+        'high_move_pct_ma5', 'low_move_pct_ma5',
+        'range_atr_ratio_lag1', 'range_atr_ratio_ma5',
+        'hi_lo_asymmetry_lag1', 'hi_lo_asymmetry_ma5',
+        'sq_ret_lag1', 'sq_ret_ewm5', 'sq_ret_ewm20',
+        'body_range_ratio_lag1', 'close_position_lag1',
+        'up_days_5d', 'up_days_10d',
+        'dow_sin', 'dow_cos', 'dom_sin', 'dom_cos',
+        'month_sin', 'month_cos',
+        'is_opex_week', 'is_quarter_end',
+    }
+    cols_to_shift = [c for c in feat.columns if c not in _ALREADY_CAUSAL]
+    feat[cols_to_shift] = feat[cols_to_shift].shift(1)
+
+    return feat.fillna(0.0)
 
 
 # Feature name list for reference
@@ -305,11 +367,19 @@ FEATURE_NAMES = [
     # Volatility
     'atr_5', 'atr_14', 'atr_ratio_5_20',
     'rv_10d', 'rv_21d', 'vol_of_vol', 'atr_pct_14',
+    # Volatility regime / dynamics
+    'atr_pctile_252d', 'atr_momentum_5d', 'atr_momentum_10d',
+    # GARCH proxy (already causal)
+    'sq_ret_lag1', 'sq_ret_ewm5', 'sq_ret_ewm20',
     # Autoregressive
     'range_pct_lag1', 'range_pct_lag2', 'range_pct_lag3', 'range_pct_lag5',
     'range_pct_ma5', 'range_pct_ma20', 'range_pct_ma60',
+    'range_pct_ewm5', 'range_pct_ewm20',
     'high_move_pct_lag1', 'low_move_pct_lag1',
     'high_move_pct_ma5', 'low_move_pct_ma5',
+    # Range dynamics
+    'range_atr_ratio_lag1', 'range_atr_ratio_ma5',
+    'hi_lo_asymmetry_lag1', 'hi_lo_asymmetry_ma5',
     # Returns / momentum
     'return_1d', 'return_5d', 'return_20d',
     'rsi_5', 'rsi_14',
@@ -334,6 +404,10 @@ FEATURE_NAMES = [
     'range_pos_5d', 'range_width_5d', 'range_compression_5d',
     'range_pos_20d', 'range_width_20d', 'range_compression_20d',
     'range_pos_63d', 'range_width_63d', 'range_compression_63d',
+    # OHLC bar structure (already causal)
+    'body_range_ratio_lag1', 'close_position_lag1',
+    # Directional (already causal)
+    'up_days_5d', 'up_days_10d',
     # Seasonality
     'dow_sin', 'dow_cos', 'dom_sin', 'dom_cos',
     'month_sin', 'month_cos',
@@ -529,8 +603,66 @@ def prepare_dataset(
     combined = combined.dropna(subset=['range_high_pct', 'range_low_pct'])
     combined = combined.fillna(0.0)
 
+    target_cols = ['range_high_pct', 'range_low_pct', 'width_pct', 'center_pct']
     return (
         combined[feature_names],
-        combined[['range_high_pct', 'range_low_pct']],
+        combined[target_cols],
+        feature_names,
+    )
+
+
+def prepare_newsletter_dataset(
+    daily: pd.DataFrame,
+    newsletter: pd.DataFrame,
+    include_gamma: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """Prepare features + newsletter targets for training.
+
+    Uses newsletter ranges as targets instead of realized ranges, for
+    reverse-engineering what the newsletter predicts.
+
+    Args:
+        daily: Daily OHLCV DataFrame (DatetimeIndex).
+        newsletter: Newsletter DataFrame with date, symbol, timeframe,
+                    range_low, range_high columns.
+        include_gamma: Whether to include gamma score feature.
+
+    Returns:
+        (features_df, targets_df, feature_names) — aligned, NaN rows dropped.
+    """
+    # Filter to ES daily
+    nl = newsletter.copy()
+    nl['date'] = pd.to_datetime(nl['date'])
+    if 'symbol' in nl.columns and 'timeframe' in nl.columns:
+        nl = nl[(nl['symbol'] == 'ES') & (nl['timeframe'] == 'daily')].copy()
+    nl = nl.set_index('date').sort_index()
+
+    # Compute features from full daily history
+    features = compute_range_features(daily)
+    prev_close = daily['close'].shift(1)
+
+    feature_names = get_feature_names(
+        include_gamma='nearby_gamma_score' in features.columns
+    )
+    feature_names = [f for f in feature_names if f in features.columns]
+
+    # Build newsletter targets relative to prev_close
+    common = nl.index.intersection(features.index).intersection(prev_close.dropna().index)
+    common = common.sort_values()
+
+    pc = prev_close.reindex(common)
+    targets = pd.DataFrame(index=common)
+    targets['nl_high_pct'] = (nl.loc[common, 'range_high'] - pc) / pc
+    targets['nl_low_pct'] = (pc - nl.loc[common, 'range_low']) / pc
+    targets['nl_width_pct'] = targets['nl_high_pct'] + targets['nl_low_pct']
+    targets['nl_center_pct'] = (targets['nl_high_pct'] - targets['nl_low_pct']) / 2
+
+    combined = features.loc[common, feature_names].join(targets)
+    combined = combined.dropna(subset=['nl_high_pct', 'nl_low_pct'])
+    combined = combined.fillna(0.0)
+
+    return (
+        combined[feature_names],
+        combined[['nl_high_pct', 'nl_low_pct', 'nl_width_pct', 'nl_center_pct']],
         feature_names,
     )
