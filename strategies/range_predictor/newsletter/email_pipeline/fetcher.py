@@ -5,6 +5,7 @@ and raw HTML/text extraction. Parameterized for reuse.
 """
 
 import base64
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -19,8 +20,8 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 DEFAULT_CREDENTIALS = Path("scrape/credentials.json")
 DEFAULT_TOKEN = Path("scrape/token.json")
 
-# Newsletter sender
-DEFAULT_SENDER = "newsletter@aheadofthenews.com"
+# Newsletter sender — set via NEWSLETTER_SENDER env var or pass explicitly
+DEFAULT_SENDER = os.environ.get("NEWSLETTER_SENDER", "")
 
 
 def get_gmail_service(

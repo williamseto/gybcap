@@ -31,7 +31,7 @@ from scrape.gmail_fetcher import (
 # ── Gmail helpers ──────────────────────────────────────────────────────
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-SENDER = "newsletter@aheadofthenews.com"
+SENDER = os.environ.get("NEWSLETTER_SENDER", "")
 
 
 def _get_gmail_service():
