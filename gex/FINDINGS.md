@@ -194,6 +194,20 @@ from reversion-favoring days. IV bucketing is marginally better than ATR
 (differential 0.27 vs 0.13 in trend-vs-reversion ratio across narrow→wide)
 but neither is dramatic enough to use as a strategy switch.
 
+## Data dependencies
+
+The replication scripts require two large binary files that are not in git:
+
+| File | Size | Description |
+|------|-----:|-------------|
+| `gex/gamma_shares_combined.parquet` | ~73 MB | EOD SPX options chain (2.5 yrs). Columns: `trade_date`, `expiration`, `strike`, `iv`, `open_interest`, `instrument_class` (C/P). Source for all IV surface + GEX features. Built from Databento OPRA statistics via `gex/dbn_opra_stats_to_chain.py` → `gex/read_opra_open_interest.py`. |
+| `raw_data/es_min_3y_clean_td_gamma.csv` | ~76 MB | 1-min ES futures bars (775 trading days). Required columns: `Date`, `Time`, `Open`/`High`/`Low`/`Close`/`Volume`, `trading_day`, `ovn` (overnight flag). |
+
+A derived file is also referenced by some scripts:
+- `data/gex_validation.csv` — produced by `gex/validate_gex_model.py`. Consumed by `sandbox/analyze_iv_intraday.py` to merge GEX regime labels into trade analyses. Regenerate with `python -m gex.validate_gex_model`.
+
+Other parquet/csv files under `gex/` (`spx_stats_combined.parquet`, `spxw_stats.parquet`, `output.parquet`, etc.) are intermediate artifacts from the chain-building pipeline and are **not** required to use the indicators or rerun the application tests — only `gamma_shares_combined.parquet` is consumed.
+
 ## How to replicate
 
 The full experiment scripts are under `sandbox/`:
