@@ -1,5 +1,19 @@
 # IV Surface Features for ES Trading — Empirical Findings
 
+> **⚠️ SUPERSEDED IN PART — read `RESEARCH_FINDINGS.md` (repo root) first.**
+> This doc reports results on the 2023–2025 (3-year) slice only. A later
+> 17-year robustness audit overturned several conclusions below:
+> - The "25-delta put skew fade-direction filter" and all fade/reversion edges
+>   **did not survive** (failed permutation/placebo; were regime curve-fits).
+> - The "1/pred_width sizing, Sharpe 1.30" figure was an artifact of an
+>   unusually calm 3-year window; the robust, regime-diverse vol-targeting lift
+>   is **+34–65% Sharpe** (still real, still the one durable edge).
+> - 3-year baseline width R²=0.018 was anomalously low; on 17yr it's ~0.40, so
+>   IV's *marginal* width-forecasting value is much smaller than shown here.
+> The IV feature *extraction* infra (`gex/iv_surface_features.py`) remains
+> valid; the trading conclusions in this file should be read through the
+> consolidated `RESEARCH_FINDINGS.md`.
+
 Research summary on what end-of-day options chain features predict for next-day
 ES futures trading. Three actionable indicators emerged; two common-sense
 applications were tested and **rejected** by the data.
